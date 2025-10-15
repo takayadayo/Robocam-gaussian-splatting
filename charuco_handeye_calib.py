@@ -10,13 +10,18 @@ from scipy.spatial.transform import Rotation as R
 
 """
 intrinsics.yaml
-    - K: camera matrix
+    - K: 内部パラメータ行列。カメラ固有の光学的特性（焦点距離 fx, fy、主点 cx, cy）をまとめたもの
     - dist: distortion coefficients (OpenCV plumb-bob order)
     - rms: reprojection error in pixel
 
-handeye.yaml
+handeye.yaml：エンドエフェクタ（アーム先端, hand）からカメラ座標への剛体変換(hand to camera)（回転Rと並進t）カメラの位置と姿勢を決定. T_camera = T_robot * X
     - Rg_c: rotation (gripper->camera)
     - tg_c: translation (gripper->camera)
+    
+colmap_sparse
+    - cameras.txt: OPENCVモデルで fx fy cx cy k1 k2 p1 p2 k3
+    - images.txt: COLMAPが要求する world to camera の回転と並進（四元数 QW QX QY QZ、Hamilton 方式）と翻訳（TX TY TZ）
+    こっちが外部パラメータ
 """
 
 # ---------- Config ----------
@@ -413,7 +418,7 @@ def run_handeye(captures: List[Capture], target2cam_list: List[Optional[Tuple[np
 def compose_base_to_cam(caps: List[Capture], Rg_c: np.ndarray, tg_c: np.ndarray):
     Tbc_list = []
     for cap in caps:
-        Rb_g, tb_g = cap.Rb_g, cap.tb_g
+        Rb_g, tb_g = cap.Rb_g, cap.tb_g        
         Rb_c = Rb_g @ Rg_c
         tb_c = Rb_g @ tg_c + tb_g
         Tbc_list.append((Rb_c, tb_c))
@@ -530,7 +535,11 @@ def main(json_path: str, image_dir: str, out_dir: str):
             f"median={np.median(valid_pose_errors):.3f}, max={max(valid_pose_errors):.3f}"
         )
 
-    Rg_c, tg_c = run_handeye(captures, Rt_list)
+    Rc_g, tc_g = run_handeye(captures, Rt_list)
+    
+    # Fix version
+    Rg_c = Rc_g.T
+    tg_c = -Rg_c @ tc_g
 
     handeye_path = os.path.join(out_dir, "handeye.yaml")
     save_yaml(handeye_path, {"Rg_c": Rg_c, "tg_c": tg_c})
