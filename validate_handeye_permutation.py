@@ -2,10 +2,29 @@
 import os, json, numpy as np, cv2
 from scipy.spatial.transform import Rotation as R
 from math import degrees
+
+'''
+calibrateHandEye に渡す入力（gripper2base, target2cam）を「そのまま／逆（inverse）」の組み合わせで4パターン試し、各パターンで出力 X を得て AX−XB 残差（回転：deg、並進：mm） を定量化します。最良パターンが「正しい表現」
+
+なぜ「総当たり検証」が必要か：calibrateHandEye は内部で A,B を相対運動に変換して AX=XB を解く。A と B の「向き」あるいは「座標に表すベクトルの定義」が 1 箇所でも逆になると、解 X が意味を成さなくなり、回転差で数度、並進で数cm〜数十cmのずれが生じる。これは理論的に当たり前（行列の逆を掛けるだけで誤差が累積）で、Hの値（今回の ~5°/50–180mm）はこの種の「向きミス」で説明可能
+
+出力で4ケース (as_is-as_is, as_is-inv, inv-as_is, inv-inv) が出る。最小の rot_med/tra_med を示すケースが正しい定義に極めて近い。
+
+想定ケース：
+・最小ケースが as_is-as_is なら現在の流れは正しい（別原因を探す）。
+・最小ケースが inv-as_is や as_is-inv なら、どちらか（robot pose / target pose）を反転して与えるべきであることが確定する。
+・最小ケースが inv-inv なら両方とも反転が必要（珍しいがあり得る）。
+
+（根拠：AX=XB の行列代数的性質により、A,B の「逆」を渡すと得られる X が逆になるため、残差が比較で極めて明確に変化する。）
+'''
+
+
 # --- adjust paths ---
 ROOT = "."
 POSE_JSON = os.path.join("hand_eye_calibration","json","poses.json")
 IMG_DIR = os.path.join("hand_eye_calibration","image")
+
+euler_order_validation = "xyz"
 
 # --- load poses (same as your code) ---
 def load_robot_json(json_path, image_dir):
@@ -16,7 +35,7 @@ def load_robot_json(json_path, image_dir):
         img = os.path.join(image_dir, os.path.basename(c["image_file"]))
         t = np.array([c["pose"]["x_mm"], c["pose"]["y_mm"], c["pose"]["z_mm"]], np.float64)/1000.0
         ang = np.array([c["pose"]["rx_deg"], c["pose"]["ry_deg"], c["pose"]["rz_deg"]], np.float64)
-        Rb_g = R.from_euler("xyz", ang, degrees=True).as_matrix()
+        Rb_g = R.from_euler(euler_order_validation, ang, degrees=True).as_matrix()
         caps.append((img, Rb_g, t.reshape(3,1)))
     return caps
 

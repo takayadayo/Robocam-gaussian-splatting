@@ -3,6 +3,16 @@ import os, json, numpy as np, cv2
 from scipy.spatial.transform import Rotation as R
 from math import degrees
 
+'''
+背景：handeye_permutation の出力は「as_is-as_is と inv-inv の両方が非常に低残差（rot_med≈0.26°、tra_med≈2.9mm）」で、as_is-inv / inv-as_is は大きく悪化する（→ 方向ミスマッチは“片側だけ反転”が最も悪い）。
+
+これは「入力（A,B）の向きが両方とも現在の定義（as_is）で一致しているか、両方とも逆（inv）で一致している」ことを示す。どちらが“物理的に正しい”かは 最終的に合成した world→camera（base→camera）を PnP／Charuco によるカメラ姿勢と照合して決めれば確定できる
+
+
+処理：
+as_is-as_is と inv-inv の両方について（a）hand-eye の X を保存、（b）各フレームの T_base->camera（合成）を計算、（c）それを PnP（Charuco から得た camera pose）と比較する。より小さく整合する方を採用する。
+'''
+
 ROOT="."
 # paths (適宜変更)
 PERM="handeye_permutation_results.json"

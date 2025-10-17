@@ -14,15 +14,17 @@ intrinsics.yaml
     - dist: distortion coefficients (OpenCV plumb-bob order)
     - rms: reprojection error in pixel
 
-handeye.yaml：エンドエフェクタ（アーム先端, hand）からカメラ座標への剛体変換(hand to camera)（回転Rと並進t）カメラの位置と姿勢を決定. T_camera = T_robot * X
-    - Rg_c: rotation (gripper->camera)
-    - tg_c: translation (gripper->camera)
+handeye.yaml：ハンド（アーム先端, グリッパ）からカメラ座標への剛体変換(hand to camera)（回転Rと並進t）カメラの位置と姿勢を決定. T_camera = T_gripper * X + tg_c
+    - Rg_c: rotation (gripper->camera)グリッパー座標系からカメラ座標系への3x3回転行列
+    - tg_c: translation (gripper->camera)グリッパー座標系の原点から見たカメラ座標系の原点への3x1並進ベクトル（位置）
     
 colmap_sparse
     - cameras.txt: OPENCVモデルで fx fy cx cy k1 k2 p1 p2 k3
     - images.txt: COLMAPが要求する world to camera の回転と並進（四元数 QW QX QY QZ、Hamilton 方式）と翻訳（TX TY TZ）
     こっちが外部パラメータ
 """
+# 一般的な回転順序の候補
+# candidate_sequences = ['xyz', 'zyx', 'XYZ', 'ZYX', 'xzy', 'yxz'] 
 
 # ---------- Config ----------
 SQUARES_X = 7
@@ -69,6 +71,14 @@ def load_robot_json(json_path: str, image_dir: str) -> List[Capture]:
             dtype=np.float64,
         )
         Rb_g = R.from_euler(EULER_ORDER, angles, degrees=True).as_matrix()
+        
+                # ===== デバッグコード挿入 =====
+        if c["image_file"] == "特定のファイル名.png": # 最初の画像などで良い
+            print(f"DEBUG: EULER_ORDER = {EULER_ORDER}")
+            print("DEBUG: Rotation matrix for first pose:")
+            print(Rb_g)
+        # ============================
+        
         caps.append(Capture(img, Rb_g, t.reshape(3, 1)))
     return caps
 

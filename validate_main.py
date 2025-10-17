@@ -4,6 +4,28 @@ import numpy as np
 import cv2
 from scipy.spatial.transform import Rotation as R
 
+'''
+検証フロー（標準3項目＋任意1項目）
+1. Charuco再投影検証（Intrinsics妥当性）
+2. AX=XB 残差分布（Hand-Eye一貫性）
+3. ボード固定剛体の整合性（各フレームから推定される Base→Board が一致するか）
+4. (任意) COLMAP整合検証（生成した images.txt/cameras.txt と理論値の一致、歪み切替の影響評価）
+
+しきい値の初期値（経験則）：
+・Charuco再投影：median ≤ 0.30px、max ≤ 0.60px（校正RMS0.2px台に対する健全域）
+・AX=XB残差（全ペア）：回転 ≤ 0.30°（median）、並進 ≤ 1.5mm（median）
+・Base→Boardばらつき：回転 ≤ 0.50°（MAD）、並進 ≤ 2.0mm（MAD）
+これらは装置精度（ロボットアームの繰返し精度、ボード寸法精度、画素ノイズ）に応じて調整可。
+
+出力：
+[1] 再投影：校正済み K,dist とCharuco検出からPnP再投影を再検証。median と max がしきい値以内なら OK。
+[2] AX=XB 残差：全ペアに対し AX と XB の差をSE(3)で評価（回転は測地角度deg、並進はmm）。median閾値で判定。
+[3] Base→Board：各フレームで推定される基座→ボードの剛体変換分布のMAD（中央値絶対偏差）。ボードが固定剛体であればこのばらつきは小さい。
+[opt] 歪みモデル：COLMAPの5係数と事前undistort+ゼロ歪みの差を定量化。差が大きいなら、(a) 事前undistort、または (b) 5係数で再校正へ切替を推奨（COLMAP仕様参照）
+
+'''
+
+
 # ---------- 固定設定（ユーザ環境に合わせて埋め込み） ----------
 ROOT = "."
 IMG_DIR = os.path.join(ROOT, "hand_eye_calibration", "image")
