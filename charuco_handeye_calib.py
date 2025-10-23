@@ -20,6 +20,7 @@ handeye.yaml：ハンド（アーム先端, グリッパ）からカメラ座標
     
 colmap_sparse
     - cameras.txt: OPENCVモデルで fx fy cx cy k1 k2 p1 p2 k3
+    (COLMAPのOPENCVモデルの"parameters"はfx, fy, cx, cy, k1, k2, p1, p2)FULL_～はこれに、k4~kが追加される。
     - images.txt: COLMAPが要求する world to camera の回転と並進（四元数 QW QX QY QZ、Hamilton 方式）と翻訳（TX TY TZ）
     こっちが外部パラメータ
 """
