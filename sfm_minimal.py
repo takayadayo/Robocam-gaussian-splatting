@@ -207,6 +207,37 @@ def project_point(K, R, t, X):
     u = K @ x
     return u[:2].reshape(2)
 
+def refine_points(K, cameras, points3d, observations, iterations=2):
+    
+    for iter_count in range(iterations):
+        num_refined = 0
+        for pid, point in enumerate(points3d):
+            if point is None:
+                continue
+            
+            registered_views = []
+            valid_obs = []
+            for img_id, uv in observations[pid]:
+                if cameras[img_id] is not None:
+                    registered_views.append(cameras[img_id])
+                    valid_obs.append(uv)
+                    
+            if len(registered_views) >= 2:
+                new_X = triangulate_n_views(K, registered_views, valid_obs)
+                
+                is_valid = True
+                for R_cam, t_cam in registered_views:
+                    if (R_cam @ new_X + t_cam.reshape(3))[2] < 1e-4:
+                        is_valid = False
+                        break
+                    
+                if is_valid:
+                    points3d[pid] = new_X
+                    num_refined += 1
+                    
+        if num_refined == 0:
+            break
+    return points3d
 
 def prune_outliers(K, cameras, points3d, observations, base_thresh=3.0, max_iter=3):
     removed_obs_total = 0
@@ -313,6 +344,77 @@ def select_initial_pair(kps, descs, K):
     _, _, i0, i1, R, t, X, kept = top
     return i0, i1, R, t, X, kept, match_dict
 
+def save_ply(filepath, points3d, imgs, observations, K):
+    """
+    3D点群をPLYファイルとして保存する。
+    各点の色は、その点を観測した最初の画像のピクセル色から取得する。
+    """
+    if points3d is None or len(points3d) == 0:
+        print("[warn] No 3D points to save.")
+        return
+
+    # 有効な3D点とその色を収集
+    valid_points = []
+    colors = []
+    
+    # どの観測がどの3D点に対応するかを逆引きするマップを作成
+    point_map = {}
+    for pid, obs_list in enumerate(observations):
+        for img_id, uv in obs_list:
+            point_map[(img_id, tuple(uv))] = pid
+
+    # 最初に観測された画像から色を取得する
+    pid_to_color_source = {}
+    for pid, p in enumerate(points3d):
+        if p is None: continue
+        
+        # この点を観測した最初の画像を探す
+        first_obs = None
+        for obs in observations[pid]:
+            img_id, uv = obs
+            if imgs[img_id] is not None:
+                first_obs = obs
+                break
+        
+        if first_obs:
+            img_id, uv = first_obs
+            u, v = int(round(uv[0])), int(round(uv[1]))
+            
+            h, w = imgs[img_id].shape[:2]
+            if 0 <= v < h and 0 <= u < w:
+                # OpenCVはBGR形式なので、RGBに変換
+                bgr = imgs[img_id][v, u]
+                rgb = (bgr[2], bgr[1], bgr[0])
+                valid_points.append(p)
+                colors.append(rgb)
+
+    if not valid_points:
+        print("[warn] No valid points with color information found to save.")
+        return
+
+    # PLYヘッダーを作成
+    header = f"""ply
+format ascii 1.0
+element vertex {len(valid_points)}
+property float x
+property float y
+property float z
+property uchar red
+property uchar green
+property uchar blue
+end_header
+"""
+
+    # PLYボディを作成
+    body = ""
+    for p, c in zip(valid_points, colors):
+        body += f"{p[0]} {p[1]} {p[2]} {c[0]} {c[1]} {c[2]}\n"
+
+    # ファイルに書き込み
+    with open(filepath, 'w') as f:
+        f.write(header + body)
+    
+    print(f"[info] Saved {len(valid_points)} points to {filepath}")
 
 def run_sfm(img_dir, out_dir):
     os.makedirs(out_dir, exist_ok=True)
@@ -322,24 +424,26 @@ def run_sfm(img_dir, out_dir):
 
     imgs_raw = [cv2.imread(f, cv2.IMREAD_COLOR) for f in files]
     H, W = imgs_raw[0].shape[:2]
-    K = build_initial_K(W, H, scale=1.2)
+    # K = build_initial_K(W, H, scale=1.2)
 
     intrinsics_path = os.path.join(out_dir, "intrinsics.yaml")
     K_loaded, dist_loaded = load_intrinsics(intrinsics_path)
     if K_loaded is not None and dist_loaded is not None:
         imgs, newK = undistort_images(imgs_raw, K_loaded, dist_loaded)
-        if newK is not None:
-            K = newK
-        else:
-            K = K_loaded
-        print(f"[info] using intrinsics from {intrinsics_path}; images undistorted.")
+        K = newK if newK is not None else K_loaded
+        print(f'[info] using instrinsics from {intrinsics_path}: images undistorted.')
+    
     else:
         imgs = imgs_raw
+        K = build_initial_K(W, H, scale=1.2)
         print("[warn] intrinsics.yaml unavailable or incomplete; using approximate K and zero distortion.")
-
+        
+    print('[info] extracting features...')
     features = [extract_sift(im) for im in imgs]
     keypoints = [f[0] for f in features]
     descriptors = [f[1] for f in features]
+    
+    print('[info] selecting initial pair...')
 
     i0, i1, R01, t01, X01, kept_pairs, initial_match_dict = select_initial_pair(keypoints, descriptors, K)
     match_dict = initial_match_dict.copy()
@@ -352,108 +456,159 @@ def run_sfm(img_dir, out_dir):
     pid_map = {}
     points3d = []
     observations = []
-    for obs in tracks:
-        imgs_in = [img_id for img_id, _ in obs]
-        if i0 in imgs_in and i1 in imgs_in:
-            kp0 = [k for (img_id, k) in obs if img_id == i0][0]
-            kp1 = [k for (img_id, k) in obs if img_id == i1][0]
+    
+    for track in tracks:
+        imgs_in_track = [obs[0] for obs in track]
+        if i0 in imgs_in_track and i1 in imgs_in_track:
+            kp0 = next(k for (img_id, k) in track if img_id == i0)
+            kp1 = next(k for (img_id, k) in track if img_id == i1)
             key = (kp0, kp1)
-            if key not in {(a, b) for a, b in kept_pairs}:
-                continue
-            idx = len(points3d)
-            X = X01[:, [kept_pairs.index((kp0, kp1))]]
-            points3d.append(X.reshape(3))
-            obs_list = []
-            for (img_id, kp_idx) in obs:
-                uv = np.array(keypoints[img_id][kp_idx].pt, dtype=np.float64)
-                obs_list.append((img_id, uv))
-            observations.append(obs_list)
-            pid_map[tuple(sorted(obs))] = idx
-
+            if key in {(a, b) for a, b in kept_pairs}:
+                idx = len(points3d)
+                X = X01[:, [kept_pairs.index(key)]].reshape(3)
+                points3d.append(X)
+                
+                obs_list = []
+                for (img_id, kp_idx) in track:
+                    uv = np.array(keypoints[img_id][kp_idx].pt, dtype=np.float64)
+                    obs_list.append((img_id, uv))
+                observations.append(obs_list)
+                pid_map[tuple(sorted(track))] = idx
+                
     registered = set([i0, i1])
-    remaining = [idx for idx in range(len(files)) if idx not in registered]
+    
+    while True:
+        view_scores =defaultdict(int)
+        for track in tracks:
+            track_key = tuple(sorted(track))
+            if track_key in pid_map and points3d[pid_map[track_key]] is not None:
+                for img_id, _ in track:
+                    if img_id not in registered:
+                        view_scores[img_id] += 1
+                        
+        candidates = sorted([(score, vid) for vid, score in view_scores.items()], reverse=True)
+        
+        if not candidates or candidates[0][0] < 10:
+            break
+        
+        best_score, best_idx = candidates[0]
+        print(f'[info] registering view {best_idx} (visible 3D points: {best_score})...')
+        
+        X3_list = []
+        x2_list = []
+        
+        for track in tracks:
+            track_key = tuple(sorted(track))
+            if track_key in pid_map and points3d[pid_map[track_key]] is not None:
+                current_view_kp = None
+                for img_id, kp_idx in track:
+                    if img_id == best_idx:
+                        current_view_kp = kp_idx
+                        break
+                if current_view_kp is not None:
+                    X3_list.append(points3d[pid_map[track_key]])
+                    uv = keypoints[best_idx][current_view_kp].pt
+                    x2_list.append(uv)
+                    
+        X3_arr = np.array(X3_list, dtype=np.float64).reshape(-1, 1, 3)
+        x2_arr = np.array(x2_list, dtype=np.float64).reshape(-1, 1, 2)
+        
+        pose = cv2.solvePnPRansac(X3_arr, x2_arr, K, None, flags=cv2.SOLVEPNP_AP3P, reprojectionError=4.0, confidence=0.999, iterationsCount=1000)
+        
+        success = False
 
-    for idx in remaining:
-        X3 = []
-        x2 = []
-        for pid, X in enumerate(points3d):
-            if X is None:
-                continue
-            for (img_id, uv) in observations[pid]:
-                if img_id == idx:
-                    X3.append(X)
-                    x2.append(uv)
-                    break
-        if len(X3) < 6:
-            continue
-        X3 = np.array(X3, dtype=np.float64).reshape(-1, 1, 3)
-        x2 = np.array(x2, dtype=np.float64).reshape(-1, 1, 2)
-        pose = cv2.solvePnPRansac(X3, x2, K, None, flags=cv2.SOLVEPNP_AP3P,
-                                  reprojectionError=2.0, confidence=0.999, iterationsCount=2000)
         if pose[0]:
             rvec, tvec = pose[1], pose[2]
-            success, rvec, tvec = cv2.solvePnP(X3, x2, K, None, rvec, tvec,
+            success, rvec, tvec = cv2.solvePnP(X3_arr, x2_arr, K, None, rvec, tvec,
                                                useExtrinsicGuess=True, flags=cv2.SOLVEPNP_ITERATIVE)
             if success:
                 R, _ = cv2.Rodrigues(rvec)
-                cameras[idx] = (R, tvec)
-                registered.add(idx)
+                cameras[best_idx] = (R, tvec)
+                registered.add(best_idx)
+                
+                print(f'  -> Success. registered views: {len(registered)} / {len(files)}')
+                
+                for reg_id in registered:
+                    if reg_id == best_idx: continue
+                    if (min(reg_id, best_idx), max(reg_id, best_idx)) not in match_dict:
+                        matches = match_features(descriptors[reg_id], descriptors[best_idx])
+                        if matches:
+                            match_dict[(min(reg_id, best_idx), max(reg_id, best_idx))] = matches
+                            
+                new_points_count = 0
+                
+                for track in tracks:
+                    track_key = tuple(sorted(track))
+                    if track_key in pid_map:
+                        continue
+                    
+                    in_current = False
+                    obs_in_registered = []
+                    
+                    for img_id, kp_idx in track:
+                        if img_id == best_idx:
+                            in_current = True
+                            
+                        if cameras[img_id] is not None:
+                            uv = np.array(keypoints[img_id][kp_idx].pt, dtype=np.float64)
+                            obs_in_registered.append((cameras[img_id], uv, img_id))
+                            
+                    if in_current and len(obs_in_registered) >= 2:
+                        cams_for_tri = [item[0] for item in obs_in_registered]
+                        uvs_for_tri = [item[1] for item in obs_in_registered]
+                        
+                        X_new = triangulate_n_views(K, cams_for_tri, uvs_for_tri)
+                        is_valid = True
+                        for R_c, t_c in cams_for_tri:
+                            if (R_c @ X_new + t_c.reshape(3))[2] < 1e-4:
+                                is_valid = False
+                                break
+                        if is_valid:
+                            new_pid = len(points3d)
+                            points3d.append(X_new)
+                            new_obs_list = [(item[2], item[1]) for item in obs_in_registered]
+                            observations.append(new_obs_list)
+                            pid_map[track_key] = new_pid
+                            new_points_count += 1
+                            
+                print(f'  -> Triangulated {new_points_count} new 3D points.')
+        
+        if not success:
+            print(f'  -> PnP failed for view {best_idx}.')
+            pass
 
-        matches = match_features(descriptors[i0], descriptors[idx])
-        matches += match_features(descriptors[i1], descriptors[idx])
-        if matches:
-            match_dict[(min(idx, i0), max(idx, i0))] = matches
 
-    if len(registered) < 2 or not points3d:
-        print("[ERROR] insufficient reconstruction results for reliable reprojection stats.")
-        print(f"  -> registered cameras: {len(registered)}")
-        print(f"  -> reconstructed points: {sum(1 for p in points3d if p is not None)}")
-        print("  -> global_rms: None")
-        with open(os.path.join(out_dir, "metrics.json"), "w") as f:
-            json.dump({
-                "global_rms_px": None,
-                "per_view": None,
-                "num_registered": len(registered),
-                "num_points": 0,
-                "note": "insufficient data to compute reliable metrics"
-            }, f, indent=2)
-        print(f"[INFO] wrote diagnostic outputs to {out_dir}")
+    print('[info] finished registration loop')
+    num_registered = sum(1 for c in cameras if c is not None)
+    if num_registered < 2 or not points3d:
+        print('[ERROR] insufficient reconstruction')
         return
-
-    prune_outliers(K, cameras, points3d, observations, base_thresh=3.0, max_iter=3)
+    
+    print('[info] refining 3D points...')
+    points3d = refine_points(K, cameras, points3d, observations, iterations=2)
+    
+    print('[info] pruning outliers...')
+    prune_outliers(K, cameras, points3d, observations, base_thresh=3.0, max_iter=5)
     stats = reprojection_stats(K, cameras, points3d, observations)
 
-    num_registered = sum(1 for cam in cameras if cam is not None)
     num_points = sum(1 for p in points3d if p is not None)
     print(f"[INFO] registered cameras: {num_registered}, reconstructed points: {num_points}")
 
-    if stats["global_rms"] is None:
-        print("[ERROR] insufficient reconstruction results for reliable reprojection stats.")
-        print("  -> global_rms: None")
-        with open(os.path.join(out_dir, "metrics.json"), "w") as f:
-            json.dump({
-                "global_rms_px": None,
-                "per_view": None,
-                "num_registered": num_registered,
-                "num_points": num_points,
-                "note": "insufficient data to compute reliable metrics"
-            }, f, indent=2)
-        print(f"[INFO] wrote diagnostic outputs to {out_dir}")
-        return
+    if stats["global_rms"] is not None:
+        print(f"[RESULT] global RMS reprojection error (px): {stats['global_rms']:.3f}")
 
-    print(f"[RESULT] global RMS reprojection error (px): {stats['global_rms']:.3f}")
-    for vid, s in stats["per_view"].items():
-        print(f" view {vid}: mean={s['mean']:.3f} med={s['median']:.3f} std={s['std']:.3f} n={s['count']}")
-
-    with open(os.path.join(out_dir, "metrics.json"), "w") as f:
+    with open(os.path.join(out_dir, "sfm_minimal", "metrics.json"), "w") as f:
         json.dump({
             "global_rms_px": stats.get("global_rms"),
             "per_view": stats.get("per_view"),
             "num_registered": num_registered,
             "num_points": num_points
         }, f, indent=2)
+        
+    ply_path = os.path.join(out_dir, "sfm_minimal", "point_cloud.ply")
+    save_ply(ply_path, points3d, imgs, observations, K)
 
-    print(f"[INFO] finished writing outputs to {out_dir}")
+    print(f"[INFO] finished writing outputs to {out_dir}/sfm_minimal")
 
 
 if __name__ == "__main__":

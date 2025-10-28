@@ -21,6 +21,9 @@ handeye.yaml：ハンド（アーム先端, グリッパ）からカメラ座標
 colmap_sparse
     - cameras.txt: OPENCVモデルで fx fy cx cy k1 k2 p1 p2 k3
     (COLMAPのOPENCVモデルの"parameters"はfx, fy, cx, cy, k1, k2, p1, p2)FULL_～はこれに、k4~kが追加される。
+    なので、 cameras.txt からは末尾の k3 を削除した方が良いかも。
+    ※SIMPLE_PINHOLEは fx+fy -> f 焦点距離にまとめられている。
+    
     - images.txt: COLMAPが要求する world to camera の回転と並進（四元数 QW QX QY QZ、Hamilton 方式）と翻訳（TX TY TZ）
     こっちが外部パラメータ
 """
@@ -74,7 +77,7 @@ def load_robot_json(json_path: str, image_dir: str) -> List[Capture]:
         Rb_g = R.from_euler(EULER_ORDER, angles, degrees=True).as_matrix()
         
                 # ===== デバッグコード挿入 =====
-        if c["image_file"] == "特定のファイル名.png": # 最初の画像などで良い
+        if c["image_file"] == "20251010T192547_773_791713d0f4ad.png": # 最初の画像などで良い
             print(f"DEBUG: EULER_ORDER = {EULER_ORDER}")
             print("DEBUG: Rotation matrix for first pose:")
             print(Rb_g)
@@ -141,6 +144,11 @@ def detect_charuco_points(image_paths: List[str], board, dict_obj) -> Tuple[List
         40,
         1e-3,
     )
+    
+    # add couter
+    visualization_count = 0
+    MAX_VISUALIZATIONS = 5
+    # end counter
 
     for path in image_paths:
         img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
@@ -195,6 +203,42 @@ def detect_charuco_points(image_paths: List[str], board, dict_obj) -> Tuple[List
 
         coverage = _board_coverage(corners, imsize)
         marker_count = 0 if marker_ids is None else len(marker_ids)
+        
+        # ======
+        # visualize part
+        # ======
+        if visualization_count < MAX_VISUALIZATIONS:
+            # 描画用にカラー画像に変換
+            img_color = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+
+            # 検出されたArUcoマーカーを描画 (存在する場合)
+            if marker_corners is not None and len(marker_corners) > 0:
+                cv2.aruco.drawDetectedMarkers(img_color, marker_corners, marker_ids)
+
+            # 検出されたCharucoコーナーを描画 (存在する場合)
+            if charuco_corners is not None and len(charuco_corners) > 0:
+                cv2.aruco.drawDetectedCornersCharuco(img_color, charuco_corners, charuco_ids)
+
+            # 画像を画面に表示
+            h, w = img_color.shape[:2]
+            display_scale = 800 / w # 横幅800pxに合わせる
+            img_display = cv2.resize(img_color, (int(w * display_scale), int(h * display_scale)))
+            
+            cv2.imshow(f"Detection Result: {os.path.basename(path)}", img_display)
+            
+            print(f"[VISUALIZATION] Displaying detection {visualization_count + 1}/{MAX_VISUALIZATIONS}. Press any key to continue, or 'q' to exit.")
+            
+            key = cv2.waitKey(0)
+            if key == ord('q'):
+                cv2.destroyAllWindows()
+                # sysをimportする必要がある
+                import sys
+                sys.exit()
+
+            cv2.destroyWindow(f"Detection Result: {os.path.basename(path)}")
+            
+            visualization_count += 1
+        # ======
 
         detections.append(
             Detection(
