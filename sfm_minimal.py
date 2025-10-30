@@ -38,33 +38,30 @@ def load_intrinsics(path):
     return K, dist
 
 def parse_colmap_poses(images_txt_path):
-    """
-    COLMAPのimages.txtをパースし、カメラポーズを読み込む。
-    戻り値: {image_name: (R_world_cam, t_world_cam)}
-    """
     poses = {}
     with open(images_txt_path, 'r') as f:
-        # 2行のヘッダーをスキップ
-        next(f, None); next(f, None); next(f, None); next(f, None)
+        # ヘッダーをスキップ
         for line in f:
-            if line.strip().startswith('#'):
-                continue
+            if line.strip().startswith('#'): continue
             
             parts = line.strip().split()
-            if len(parts) < 10:
-                continue
+            if len(parts) < 10: continue
             
             # IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME
-            image_id, qw, qx, qy, qz, tx, ty, tz, camera_id, name = parts[:10]
-            q = np.array([float(qx), float(qy), float(qz), float(qw)]) # scipyは [x,y,z,w]
-            t = np.array([float(tx), float(ty), float(tz)]).reshape(3, 1)
+            qw, qx, qy, qz = float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4])
+            tx, ty, tz = float(parts[5]), float(parts[6]), float(parts[7])
+            name = parts[9]
             
-            # COLMAPの T_world_cam (c_w) から OpenCV形式の T_world_cam へ変換
-            Rc_w = R.from_quat(q).as_matrix()
-            R_w_c = Rc_w.T
-            t_w_c = -R_w_c @ t
+            # scipyのquatは [x, y, z, w]
+            q_scipy = np.array([qx, qy, qz, qw])
+            t_vec = np.array([tx, ty, tz]).reshape(3, 1)
             
-            poses[name] = (R_w_c, t_w_c)
+            # COLMAPのq,tは T_cam_world (R_cw, t_cw) を直接定義している
+            R_cw = R.from_quat(q_scipy).as_matrix()
+            
+            # 逆変換は行わず、そのまま T_cam_world として保存
+            poses[name] = (R_cw, t_vec)
+            
             # 2行目はPOINTS2Dなので読み飛ばす
             next(f, None)
     return poses
@@ -721,7 +718,7 @@ def reconstruct_with_fixed_poses(files, K, cameras, keypoints, descriptors):
             
             if proj is not None:
                 reproj_error = np.linalg.norm(proj - uv_obs)
-                if reproj_error < 2.5: # 再投影誤差の閾値
+                if reproj_error < 25: # 再投影誤差の閾値
                     valid_observations_in_track.append((img_id, kp_idx))
         
         # 2つ以上の有効な観測があれば、リファインメントを行う

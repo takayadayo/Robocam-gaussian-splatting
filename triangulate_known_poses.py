@@ -40,11 +40,10 @@ from scipy.spatial.transform import Rotation as R
 
 # ----------------------- Config (feel free to tweak) -----------------------
 EULER_ORDER = "xyz"   # must match your robot JSON convention
-MIN_MATCHES = 80       # required matches to triangulate a pair
-RATIO_TEST = 0.95      # Lowe ratio test for descriptor matching
+MIN_MATCHES = 20       # required matches to triangulate a pair (LightGlue is strong)
 SAMPSON_THRESH = 10   # pixels; epipolar consistency threshold
-REPROJ_THRESH = 10    # pixels; per-view reprojection error threshold
-MIN_TRI_ANGLE_DEG = 1.5  # filter poorly conditioned triangulations
+REPROJ_THRESH = 20    # pixels; per-view reprojection error threshold
+MIN_TRI_ANGLE_DEG = 1  # filter poorly conditioned triangulations
 PAIR_GAP = 1           # match i with i+PAIR_GAP (1=consecutive)
 MAX_PAIRS = None       # limit number of pairs for speed (None = all)
 
@@ -120,6 +119,16 @@ def undistort_px(pts_px: np.ndarray, K: np.ndarray, dist: np.ndarray) -> np.ndar
     pts = pts_px.reshape(-1, 1, 2).astype(np.float64)
     undist = cv2.undistortPoints(pts, K, dist, P=K)
     return undist.reshape(-1, 2)
+
+# --- Helpers for deep matchers (LightGlue) ---
+def cv2_to_torch(img: np.ndarray, device: str):
+    """Convert OpenCV BGR uint8 HxWx3 to torch float tensor (1,3,H,W) in [0,1]."""
+    import torch
+    if img.ndim == 2:
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    t = torch.from_numpy(img[:, :, ::-1].copy()).float() / 255.0  # BGR->RGB
+    t = t.permute(2, 0, 1).unsqueeze(0).to(device)  # (1,3,H,W)
+    return t
 
 
 def relative_pose(R1: np.ndarray, t1: np.ndarray, R2: np.ndarray, t2: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -280,20 +289,21 @@ def main(args):
     # Export poses in COLMAP text (optional but handy for 3DGS)
     export_colmap_text(out_dir, K, image_paths, Rcw_list, tcw_list, W, H)
 
-    # Feature detector & matcher
-    if hasattr(cv2, "SIFT_create"):
-        detector = cv2.SIFT_create()
-        norm = cv2.NORM_L2
-        print("[INFO] Using SIFT")
-    else:
-        detector = cv2.ORB_create(nfeatures=4000)
-        norm = cv2.NORM_HAMMING
-        print("[INFO] Using ORB")
-    bf = cv2.BFMatcher(norm)
+    # ---- Feature extractor & matcher: LightGlue + SuperPoint ----
+    try:
+        import torch
+        from lightglue import LightGlue, SuperPoint
+        from lightglue.utils import rbd
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        print(f"[INFO] Using LightGlue+SuperPoint on {device}")
+        # Accuracy-first preset per official README: disable adaptivity for max accuracy
+        extractor = SuperPoint(max_num_keypoints=2048).eval().to(device)
+        matcher = LightGlue(features='superpoint', depth_confidence=-1, width_confidence=-1).eval().to(device)
+    except Exception as e:
+        raise RuntimeError("LightGlue not available. Please `pip install lightglue torch torchvision` (and a CUDA-enabled Torch if you have a GPU).") from e
 
     # Triangulation across pairs
-    all_X = []
-    all_rgb = []
+    all_X, all_rgb = [], []
     pair_count = 0
 
     for i in range(0, len(image_paths) - PAIR_GAP):
@@ -305,18 +315,23 @@ def main(args):
         if img1 is None or img2 is None:
             continue
 
-        # detect & describe
-        k1, d1 = detector.detectAndCompute(img1, None)
-        k2, d2 = detector.detectAndCompute(img2, None)
-        if d1 is None or d2 is None or len(k1) < 50 or len(k2) < 50:
+        # extract & match with LightGlue
+        t1 = cv2_to_torch(img1, device)
+        t2 = cv2_to_torch(img2, device)
+        with torch.no_grad():
+            feats1 = extractor.extract(t1)
+            feats2 = extractor.extract(t2)
+            matches_dict = matcher({'image0': feats1, 'image1': feats2})
+        feats1, feats2, matches_dict = [rbd(x) for x in [feats1, feats2, matches_dict]]
+        matches = matches_dict['matches'].cpu().numpy()
+        if matches.size == 0:
             continue
-        matches = bf.knnMatch(d1, d2, k=2)
-        good = [m for m, n in matches if m.distance < RATIO_TEST * n.distance]
-        if len(good) < MIN_MATCHES:
+        kpts1 = feats1['keypoints'].cpu().numpy()
+        kpts2 = feats2['keypoints'].cpu().numpy()
+        pts1_px = kpts1[matches[:, 0]]
+        pts2_px = kpts2[matches[:, 1]]
+        if len(pts1_px) < MIN_MATCHES:
             continue
-
-        pts1_px = np.array([k1[m.queryIdx].pt for m in good], dtype=np.float64)
-        pts2_px = np.array([k2[m.trainIdx].pt for m in good], dtype=np.float64)
 
         # undistort to pixel coords (P=K keeps pixel domain but removes distortion)
         pts1_ud = undistort_px(pts1_px, K, dist)
@@ -327,7 +342,7 @@ def main(args):
         Rcw2, tcw2 = Rcw_list[j], tcw_list[j]
         F = fundamental_from_poses(K, Rcw1, tcw1, Rcw2, tcw2)
         se = sampson_errors(F, pts1_ud, pts2_ud)
-        keep = se < (SAMPSON_THRESH ** 2)
+        keep = se < (SAMPSON_THRESH)
         if keep.sum() < MIN_MATCHES:
             continue
 
@@ -342,7 +357,6 @@ def main(args):
         Xw, errs, valid = triangulate_pair(K, dist, P1, P2, pts1, pts2)
 
         # angle-of-triangulation filtering
-        # camera centers in world
         C1 = (-Rcw1.T @ tcw1).reshape(3)
         C2 = (-Rcw2.T @ tcw2).reshape(3)
         dirs1 = Xw - C1
@@ -361,13 +375,16 @@ def main(args):
         all_X.append(X_good)
         all_rgb.append(colors)
         pair_count += 1
-        print(f"[INFO] pair {i}-{j}: matches={len(good)} kept={len(X_good)}")
+        print(f"[INFO] pair {i}-{j}: matches={len(matches)} kept={len(X_good)}")
 
         # optional debug dump
         if args.dump_matches:
             md = Path(out_dir) / "matches"; md.mkdir(exist_ok=True)
-            vis = cv2.drawMatches(img1, k1, img2, k2, [good[k] for k, m in enumerate(keep) if m], None)
-            cv2.imwrite(str(md / f"pair_{i:04d}_{j:04d}.jpg"), vis)
+            canvas = np.hstack([img1, img2])
+            off = img1.shape[1]
+            for a, b in zip(pts1[good_mask].astype(int), pts2[good_mask].astype(int)):
+                cv2.line(canvas, (int(a[0]), int(a[1])), (int(b[0])+off, int(b[1])), (0,255,0), 1)
+            cv2.imwrite(str(md / f"pair_{i:04d}_{j:04d}.jpg"), canvas)
 
     if not all_X:
         raise RuntimeError("No triangulated points survived filtering. Check thresholds or inputs.")
@@ -388,8 +405,34 @@ def main(args):
         "num_points": int(len(X_cat)),
         "params": {
             "MIN_MATCHES": MIN_MATCHES,
-            "RATIO_TEST": RATIO_TEST,
             "SAMPSON_THRESH": SAMPSON_THRESH,
+            "REPROJ_THRESH": REPROJ_THRESH,
+            "MIN_TRI_ANGLE_DEG": MIN_TRI_ANGLE_DEG,
+            "PAIR_GAP": PAIR_GAP,
+        },
+    }
+    with open(out_dir / "stats.json", "w") as f:
+        json.dump(stats, f, indent=2)
+
+        raise RuntimeError("No triangulated points survived filtering. Check thresholds or inputs.")
+
+    # concatenate and (optionally) downsample
+    X_cat = np.vstack(all_X)
+    RGB_cat = np.vstack(all_rgb)
+
+    # Write PLY
+    ply_path = out_dir / "triangulated.ply"
+    write_ply(ply_path, X_cat, RGB_cat)
+    print(f"[INFO] wrote {ply_path} with {len(X_cat)} points")
+
+    # Stats JSON
+    stats = {
+        "num_images": len(image_paths),
+        "num_pairs": pair_count,
+        "num_points": int(len(X_cat)),
+        "params": {
+            "MIN_MATCHES": MIN_MATCHES,
+                        "SAMPSON_THRESH": SAMPSON_THRESH,
             "REPROJ_THRESH": REPROJ_THRESH,
             "MIN_TRI_ANGLE_DEG": MIN_TRI_ANGLE_DEG,
             "PAIR_GAP": PAIR_GAP,

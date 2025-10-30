@@ -1,13 +1,12 @@
 {
   "num_images": 31,
-  "num_pairs": 9,
-  "num_points": 452,
+  "num_pairs": 2,
+  "num_points": 74,
   "params": {
-    "MIN_MATCHES": 80,
-    "RATIO_TEST": 0.95,
+    "MIN_MATCHES": 20,
     "SAMPSON_THRESH": 10,
-    "REPROJ_THRESH": 10,
-    "MIN_TRI_ANGLE_DEG": 1.5,
+    "REPROJ_THRESH": 20,
+    "MIN_TRI_ANGLE_DEG": 1,
     "PAIR_GAP": 1
   }
 }
