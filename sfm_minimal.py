@@ -234,22 +234,26 @@ def triangulate_n_views(K, cams, observations, min_parallax_deg=1.0, max_reproj_
     X_h = Vt[-1]
 
     if abs(X_h[3]) < 1e-6:
+        print("[DEBUG|triangulate_n_views] Rejected: SVD failed (w is near zero)")
         return None
     X_h /= X_h[3]
     X = X_h[:3]
 
-    # 2. Cheirality Check (全てのカメラの前方にあるか)
-    for R, t in cams:
+    # 2. Cheirality Check
+    for i, (R, t) in enumerate(cams):
         if (R @ X + t.reshape(3))[2] <= 1e-4:
+            print(f"[DEBUG|triangulate_n_views] Rejected: Cheirality failed for cam {i}")
             return None
 
     # 3. 個別再投影誤差チェック
-    for (R, t), uv_obs in zip(cams, observations):
+    for i, ((R, t), uv_obs) in enumerate(zip(cams, observations)):
         proj = project_point(K, R, t, X.reshape(3, 1))
         if proj is None:
+            print(f"[DEBUG|triangulate_n_views] Rejected: Projection failed for cam {i}")
             return None
         error = np.linalg.norm(proj - uv_obs)
         if error > max_reproj_error_px:
+            print(f"[DEBUG|triangulate_n_views] Rejected: Reprojection error ({error:.2f}px > {max_reproj_error_px}px) for cam {i}")
             return None
 
     # 4. 視差角チェック
@@ -271,6 +275,7 @@ def triangulate_n_views(K, cams, observations, min_parallax_deg=1.0, max_reproj_
             max_angle_rad = max(max_angle_rad, angle_rad)
     
     if np.rad2deg(max_angle_rad) < min_parallax_deg:
+        print(f"[DEBUG|triangulate_n_views] Rejected: Parallax angle ({np.rad2deg(max_angle_rad):.2f}deg < {min_parallax_deg}deg)")
         return None
 
     return X
@@ -639,7 +644,8 @@ def reconstruct_with_fixed_poses(files, K, cameras, keypoints, descriptors):
     
     # 視差角を効率的に計算するためのカメラ中心
     cam_centers = {i: -cam[0].T @ cam[1] for i, cam in enumerate(cameras) if cam is not None}
-
+    # === デバッグ用: 視差角の分布を記録 ===
+    all_best_angles_deg = []
     for track_idx, track in enumerate(full_tracks):
         if len(track) < 2:
             continue
@@ -691,11 +697,27 @@ def reconstruct_with_fixed_poses(files, K, cameras, keypoints, descriptors):
                     best_pair_3d_point = X
                     best_pair_indices = (img_id1, img_id2)
         
-        # 最も良かったペアが品質基準を満たしていれば初期点として採用
-        if np.rad2deg(best_pair_angle) > 2.0: # 視差角の閾値
+        if best_pair_angle > 0:
+            all_best_angles_deg.append(np.rad2deg(best_pair_angle))
+
+        if np.rad2deg(best_pair_angle) > 2.0:
             initial_points[track_idx] = (best_pair_3d_point, best_pair_indices)
 
+    # === デバッグ用: 視差角の統計情報を表示 ===
+    if all_best_angles_deg:
+        angles_arr = np.array(all_best_angles_deg)
+        print(f"\n[DEBUG] Parallax angle stats (deg) for {len(angles_arr)} tracks:")
+        print(f"  Min: {angles_arr.min():.2f}, Median: {np.median(angles_arr):.2f}, Max: {angles_arr.max():.2f}")
+        print(f"  Tracks exceeding 2.0 deg threshold: {np.sum(angles_arr > 2.0)} / {len(angles_arr)}\n")
+    else:
+        print("\n[DEBUG] No valid pairs found to calculate parallax angles.\n")
+
     print(f"[info] Initialized {len(initial_points)} points with sufficient parallax.")
+
+    # ★★★ ここで処理を中断して確認 ★★★
+    if len(initial_points) == 0:
+        print("[ERROR] No 3D points could be initialized. The parallax angle threshold (2.0 deg) might be too strict for this dataset, or feature matches are poor.")
+        return [], []
 
     # --- Step 2: トラックの成長とリファインメント ---
     print("[info] Step 2: Growing and refining tracks...")
@@ -718,7 +740,7 @@ def reconstruct_with_fixed_poses(files, K, cameras, keypoints, descriptors):
             
             if proj is not None:
                 reproj_error = np.linalg.norm(proj - uv_obs)
-                if reproj_error < 25: # 再投影誤差の閾値
+                if reproj_error < 2.5: # 再投影誤差の閾値
                     valid_observations_in_track.append((img_id, kp_idx))
         
         # 2つ以上の有効な観測があれば、リファインメントを行う
