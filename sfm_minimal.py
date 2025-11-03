@@ -764,6 +764,25 @@ def reconstruct_with_fixed_poses(files, K, cameras, keypoints, descriptors):
     print(f"[info] Successfully reconstructed {len(points3d)} points after growing.")
     return points3d, observations
 
+def save_poses_to_json(filepath, cameras, files):
+    """ SfMで計算されたカメラポーズをJSONファイルに保存する """
+    pose_data = {}
+    valid_poses = 0
+    for i, cam in enumerate(cameras):
+        if cam is not None:
+            R_wc, t_wc = cam  # SfMは T_world_cam を計算する
+            # JSONに保存しやすいようにリストに変換
+            pose_data[os.path.basename(files[i])] = {
+                'R_wc': R_wc.tolist(),
+                't_wc': t_wc.flatten().tolist()
+            }
+            valid_poses += 1
+    
+    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+    with open(filepath, 'w') as f:
+        json.dump(pose_data, f, indent=4)
+    print(f"[INFO] Saved {valid_poses} SfM-computed poses to {filepath}")
+
 def main(image_dir, out_dir, poses_path=None):
     os.makedirs(out_dir, exist_ok=True)
     files = load_images(image_dir)
@@ -830,7 +849,10 @@ def main(image_dir, out_dir, poses_path=None):
         if cameras is None:
             print("[ERROR] Incremental SfM failed. Exiting.")
             sys.exit(1)
-
+        # ★★★ ここに追記 ★★★
+        sfm_poses_path = os.path.join(out_dir, "sfm_minimal", "sfm_computed_poses.json")
+        save_poses_to_json(sfm_poses_path, cameras, files)
+        # ★★★ 追記ここまで ★★★
     # --- Finalization (両モード共通) ---
     if not points3d:
         print("[ERROR] No 3D points were reconstructed.")
