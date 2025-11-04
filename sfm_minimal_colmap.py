@@ -981,7 +981,7 @@ def main(image_dir, out_dir, poses_path=None, inject_poses_path=None):
             files, K, keypoints, descriptors, imgs,
             inject_pose_map=inject_map
         )
-        mode_name = 'sfmMode'
+        mode_name = 'sfm&Pose_Mode'
         if cameras is None:
             print("[ERROR] Incremental SfM failed. Exiting.")
             sys.exit(1)
