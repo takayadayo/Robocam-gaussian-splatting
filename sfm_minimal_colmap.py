@@ -907,6 +907,10 @@ def main(image_dir, out_dir, poses_path=None):
         if cameras is None:
             print("[ERROR] Incremental SfM failed. Exiting.")
             sys.exit(1)
+        
+        # sfm_poses_path = os.path.join(out_dir, "sfm_minimal", "sfm_computed_poses.json")
+        # save_poses_to_json(sfm_poses_path, cameras, files)
+        
         colmap_out = os.path.join(out_dir, "sfm_minimal", "colmap_export")
         _export_colmap_files(colmap_out, files, K, cameras)
     # --- Finalization (両モード共通) ---
