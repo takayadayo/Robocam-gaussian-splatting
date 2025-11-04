@@ -476,7 +476,7 @@ end_header
     
     print(f"[info] Saved {len(valid_points)} points to {filepath}")
 
-def run_incremental_sfm(files, K, keypoints, descriptors, imgs):
+def run_incremental_sfm(files, K, keypoints, descriptors, imgs, inject_pose_map=None):
     """
     画像と特徴量から、増分型SfMを実行してカメラポーズと3D点群を推定する。
     """
@@ -558,20 +558,54 @@ def run_incremental_sfm(files, K, keypoints, descriptors, imgs):
         print(f"[info] Registering view {best_idx} (visible 3D points: {view_scores[best_idx]})...")
 
         # PnPのためのデータ準備
-        pids_for_pnp = point_indices_for_view[best_idx]
-        X3_list = [points3d[pid] for pid in pids_for_pnp]
-        x2_list = [next(uv for img_id, uv in observations[pid] if img_id == best_idx) for pid in pids_for_pnp]
+        # pids_for_pnp = point_indices_for_view[best_idx]
+        # X3_list = [points3d[pid] for pid in pids_for_pnp]
+        # x2_list = [next(uv for img_id, uv in observations[pid] if img_id == best_idx) for pid in pids_for_pnp]
 
-        X3_arr = np.array(X3_list, dtype=np.float64).reshape(-1, 1, 3)
-        x2_arr = np.array(x2_list, dtype=np.float64).reshape(-1, 1, 2)
+        # X3_arr = np.array(X3_list, dtype=np.float64).reshape(-1, 1, 3)
+        # x2_arr = np.array(x2_list, dtype=np.float64).reshape(-1, 1, 2)
         
-        success, rvec, tvec, inliers = cv2.solvePnPRansac(X3_arr, x2_arr, K, None, flags=cv2.SOLVEPNP_AP3P, reprojectionError=2.0)
+        # success, rvec, tvec, inliers = cv2.solvePnPRansac(X3_arr, x2_arr, K, None, flags=cv2.SOLVEPNP_AP3P, reprojectionError=2.0)
         
-        if success and inliers is not None and len(inliers) >= 6:
-            R_new, _ = cv2.Rodrigues(rvec)
-            cameras[best_idx] = (R_new, tvec)
-            registered.add(best_idx)
-            print(f"  -> Success. Registered views: {len(registered)}/{len(files)}")
+        # if success and inliers is not None and len(inliers) >= 6:
+        #     R_new, _ = cv2.Rodrigues(rvec)
+        #     cameras[best_idx] = (R_new, tvec)
+        #     registered.add(best_idx)
+        #     print(f"  -> Success. Registered views: {len(registered)}/{len(files)}")
+
+        # --- 局所置換：既知ポーズがあればそれを使う／なければPnP ---
+        used_known_pose = False
+        if inject_pose_map is not None:
+            name = os.path.basename(files[best_idx])
+            if name in inject_pose_map:
+                # 既知の (R_cw, t_cw) をそのまま採用
+                cameras[best_idx] = inject_pose_map[name]
+                registered.add(best_idx)
+                used_known_pose = True
+                print(f"  -> Used injected pose for view {best_idx}: {name}")
+
+        if not used_known_pose:
+            # PnPのためのデータ準備
+            pids_for_pnp = point_indices_for_view[best_idx]
+            X3_list = [points3d[pid] for pid in pids_for_pnp]
+            x2_list = [next(uv for img_id, uv in observations[pid] if img_id == best_idx) for pid in pids_for_pnp]
+
+            X3_arr = np.array(X3_list, dtype=np.float64).reshape(-1, 1, 3)
+            x2_arr = np.array(x2_list, dtype=np.float64).reshape(-1, 1, 2)
+
+            # 既知ポーズが “近傍初期値” として手に入る場合は useExtrinsicGuess で微調整も可能
+            # （今回は局所置換方針のため未使用。必要なら rvec/tvec 初期値を与えて refine 可能）
+            success, rvec, tvec, inliers = cv2.solvePnPRansac(
+                X3_arr, x2_arr, K, None,
+                flags=cv2.SOLVEPNP_AP3P,
+                reprojectionError=2.0
+            )
+
+            if success and inliers is not None and len(inliers) >= 6:
+                R_new, _ = cv2.Rodrigues(rvec)
+                cameras[best_idx] = (R_new, tvec)
+                registered.add(best_idx)
+                print(f"  -> Success. Registered views: {len(registered)}/{len(files)}")
             
             # =============================================================
             #  新規点の三角測量ロジック (ここからが核心部分)
@@ -840,8 +874,41 @@ def _export_colmap_files(out_dir, files, K_used, cameras):
     print(f"[INFO] Wrote COLMAP txt to: {out_dir}")
 # --------------------------------------------------------------------
 
+def _plot_scene_quick(cameras, points3d):
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
-def main(image_dir, out_dir, poses_path=None):
+    cam_centers = []
+    cam_dirs = []
+    for cam in cameras:
+        if cam is None:
+            cam_centers.append(None); cam_dirs.append(None); continue
+        Rcw, tcw = cam
+        C = -Rcw.T @ tcw  # camera center in world
+        z_cam = Rcw.T @ np.array([[0.0],[0.0],[1.0]])  # camera forward in world
+        cam_centers.append(C.flatten())
+        cam_dirs.append(z_cam.flatten())
+
+    fig = plt.figure()
+    ax = fig.add_subplot(111, projection='3d')
+
+    # points
+    pts = np.array([p for p in points3d if p is not None], dtype=np.float64)
+    if pts.size > 0:
+        ax.scatter(pts[:,0], pts[:,1], pts[:,2], s=1, alpha=0.6)
+
+    # cameras
+    for C, d in zip(cam_centers, cam_dirs):
+        if C is None: continue
+        ax.scatter([C[0]],[C[1]],[C[2]], marker='^', s=20)
+        ax.plot([C[0], C[0]+0.03*d[0]],[C[1], C[1]+0.03*d[1]],[C[2], C[2]+0.03*d[2]], linewidth=1)
+
+    ax.set_xlabel("X"); ax.set_ylabel("Y"); ax.set_zlabel("Z")
+    ax.set_title("Cameras and 3D points (quick look)")
+    plt.show()
+
+
+def main(image_dir, out_dir, poses_path=None, inject_poses_path=None):
     os.makedirs(out_dir, exist_ok=True)
     files = load_images(image_dir)
     if len(files) < 2: 
@@ -902,7 +969,18 @@ def main(image_dir, out_dir, poses_path=None):
         # =================================================================
         #  MODE A: Incremental SfM
         # =================================================================
-        cameras, points3d, observations = run_incremental_sfm(files, K, keypoints, descriptors, imgs)
+        # cameras, points3d, observations = run_incremental_sfm(files, K, keypoints, descriptors, imgs)
+        # 既知ポーズの“注入表”を用意（局所置換用）
+        inject_map = None
+        if inject_poses_path:
+            print(f"[info] Loading poses to inject (for local replacement) from {inject_poses_path}")
+            inject_map = parse_colmap_poses(inject_poses_path)
+            print(f"[info] Prepared {len(inject_map)} poses for possible injection.")
+
+        cameras, points3d, observations = run_incremental_sfm(
+            files, K, keypoints, descriptors, imgs,
+            inject_pose_map=inject_map
+        )
         mode_name = 'sfmMode'
         if cameras is None:
             print("[ERROR] Incremental SfM failed. Exiting.")
@@ -937,6 +1015,13 @@ def main(image_dir, out_dir, poses_path=None):
             json.dump(stats, f, indent=4)
         print(f"[info] Saved detailed metrics to {metrics_path}")
 
+    # quick 3D visualization
+    try:
+        _plot_scene_quick(cameras, points3d)
+    except Exception as e:
+        print(f"[warn] quick visualization failed: {e}")
+
+
     ply_path = os.path.join(out_dir, 'sfm_minimal', f"point_cloud_{mode_name}.ply")
     save_ply(ply_path, points3d, imgs_raw, observations)
     print(f"[INFO] Finished writing outputs to {out_dir}")
@@ -954,6 +1039,9 @@ if __name__ == "__main__":
              "If not provided, the script runs in incremental SfM mode.",
         default=None
     )
+    parser.add_argument(
+        "--inject_poses",
+        help="(SfM mode only) Path to COLMAP images.txt whose poses will be LOCALLY injected ONLY for pose estimation steps.",default=None)
     args = parser.parse_args()
 
-    main(args.image_dir, args.out_dir, args.poses)
+    main(args.image_dir, args.out_dir, args.poses, args.inject_poses)
