@@ -906,6 +906,39 @@ def _export_colmap_files(out_dir, files, K_used, cameras):
     print(f"[INFO] Wrote COLMAP txt to: {out_dir}")
 # --------------------------------------------------------------------
 
+def _plot_scene_quick(cameras, points3d):
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+
+    cam_centers = []
+    cam_dirs = []
+    for cam in cameras:
+        if cam is None:
+            cam_centers.append(None); cam_dirs.append(None); continue
+        Rcw, tcw = cam
+        C = -Rcw.T @ tcw  # camera center in world
+        z_cam = Rcw.T @ np.array([[0.0],[0.0],[1.0]])  # camera forward in world
+        cam_centers.append(C.flatten())
+        cam_dirs.append(z_cam.flatten())
+
+    fig = plt.figure()
+    ax = fig.add_subplot(111, projection='3d')
+
+    # points
+    pts = np.array([p for p in points3d if p is not None], dtype=np.float64)
+    if pts.size > 0:
+        ax.scatter(pts[:,0], pts[:,1], pts[:,2], s=1, alpha=0.6)
+
+    # cameras
+    for C, d in zip(cam_centers, cam_dirs):
+        if C is None: continue
+        ax.scatter([C[0]],[C[1]],[C[2]], marker='^', s=20)
+        ax.plot([C[0], C[0]+0.03*d[0]],[C[1], C[1]+0.03*d[1]],[C[2], C[2]+0.03*d[2]], linewidth=1)
+
+    ax.set_xlabel("X"); ax.set_ylabel("Y"); ax.set_zlabel("Z")
+    ax.set_title("Cameras and 3D points (quick look)")
+    plt.show()
+
 
 def main(image_dir, out_dir, poses_path=None, mode='sfm'):
     os.makedirs(out_dir, exist_ok=True)
@@ -977,15 +1010,17 @@ def main(image_dir, out_dir, poses_path=None, mode='sfm'):
         print("[info] No pose file provided. Running in Incremental SfM mode.")
         cameras, points3d, observations = run_incremental_sfm(files, K, keypoints, descriptors, imgs)
         mode_name = 'sfmMode'
-
-    if cameras is None or observations is None:
-        print("[ERROR] Reconstruction failed in the selected mode. Exiting.")
-        sys.exit(1)        
+        
         # sfm_poses_path = os.path.join(out_dir, "sfm_minimal", "sfm_computed_poses.json")
         # save_poses_to_json(sfm_poses_path, cameras, files)
         
         colmap_out = os.path.join(out_dir, "sfm_minimal", "colmap_export")
         _export_colmap_files(colmap_out, files, K, cameras)
+
+    if cameras is None or observations is None:
+        print("[ERROR] Reconstruction failed in the selected mode. Exiting.")
+        sys.exit(1)        
+
     # --- Finalization (両モード共通) ---
     if not points3d:
         print("[ERROR] No 3D points were reconstructed.")
@@ -1009,6 +1044,13 @@ def main(image_dir, out_dir, poses_path=None, mode='sfm'):
         with open(metrics_path, "w") as f:
             json.dump(stats, f, indent=4)
         print(f"[info] Saved detailed metrics to {metrics_path}")
+
+    # quick 3D visualization
+    try:
+        _plot_scene_quick(cameras, points3d)
+    except Exception as e:
+        print(f"[warn] quick visualization failed: {e}")
+
 
     ply_path = os.path.join(out_dir, 'sfm_minimal', f"point_cloud_{mode_name}.ply")
     save_ply(ply_path, points3d, imgs_raw, observations)
