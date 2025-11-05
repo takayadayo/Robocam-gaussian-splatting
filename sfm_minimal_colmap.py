@@ -476,7 +476,7 @@ end_header
     
     print(f"[info] Saved {len(valid_points)} points to {filepath}")
 
-def run_incremental_sfm(files, K, keypoints, descriptors, imgs, inject_pose_map=None):
+def run_incremental_sfm(files, K, keypoints, descriptors, imgs):
     """
     画像と特徴量から、増分型SfMを実行してカメラポーズと3D点群を推定する。
     """
@@ -558,54 +558,20 @@ def run_incremental_sfm(files, K, keypoints, descriptors, imgs, inject_pose_map=
         print(f"[info] Registering view {best_idx} (visible 3D points: {view_scores[best_idx]})...")
 
         # PnPのためのデータ準備
-        # pids_for_pnp = point_indices_for_view[best_idx]
-        # X3_list = [points3d[pid] for pid in pids_for_pnp]
-        # x2_list = [next(uv for img_id, uv in observations[pid] if img_id == best_idx) for pid in pids_for_pnp]
+        pids_for_pnp = point_indices_for_view[best_idx]
+        X3_list = [points3d[pid] for pid in pids_for_pnp]
+        x2_list = [next(uv for img_id, uv in observations[pid] if img_id == best_idx) for pid in pids_for_pnp]
 
-        # X3_arr = np.array(X3_list, dtype=np.float64).reshape(-1, 1, 3)
-        # x2_arr = np.array(x2_list, dtype=np.float64).reshape(-1, 1, 2)
+        X3_arr = np.array(X3_list, dtype=np.float64).reshape(-1, 1, 3)
+        x2_arr = np.array(x2_list, dtype=np.float64).reshape(-1, 1, 2)
         
-        # success, rvec, tvec, inliers = cv2.solvePnPRansac(X3_arr, x2_arr, K, None, flags=cv2.SOLVEPNP_AP3P, reprojectionError=2.0)
+        success, rvec, tvec, inliers = cv2.solvePnPRansac(X3_arr, x2_arr, K, None, flags=cv2.SOLVEPNP_AP3P, reprojectionError=2.0)
         
-        # if success and inliers is not None and len(inliers) >= 6:
-        #     R_new, _ = cv2.Rodrigues(rvec)
-        #     cameras[best_idx] = (R_new, tvec)
-        #     registered.add(best_idx)
-        #     print(f"  -> Success. Registered views: {len(registered)}/{len(files)}")
-
-        # --- 局所置換：既知ポーズがあればそれを使う／なければPnP ---
-        used_known_pose = False
-        if inject_pose_map is not None:
-            name = os.path.basename(files[best_idx])
-            if name in inject_pose_map:
-                # 既知の (R_cw, t_cw) をそのまま採用
-                cameras[best_idx] = inject_pose_map[name]
-                registered.add(best_idx)
-                used_known_pose = True
-                print(f"  -> Used injected pose for view {best_idx}: {name}")
-
-        if not used_known_pose:
-            # PnPのためのデータ準備
-            pids_for_pnp = point_indices_for_view[best_idx]
-            X3_list = [points3d[pid] for pid in pids_for_pnp]
-            x2_list = [next(uv for img_id, uv in observations[pid] if img_id == best_idx) for pid in pids_for_pnp]
-
-            X3_arr = np.array(X3_list, dtype=np.float64).reshape(-1, 1, 3)
-            x2_arr = np.array(x2_list, dtype=np.float64).reshape(-1, 1, 2)
-
-            # 既知ポーズが “近傍初期値” として手に入る場合は useExtrinsicGuess で微調整も可能
-            # （今回は局所置換方針のため未使用。必要なら rvec/tvec 初期値を与えて refine 可能）
-            success, rvec, tvec, inliers = cv2.solvePnPRansac(
-                X3_arr, x2_arr, K, None,
-                flags=cv2.SOLVEPNP_AP3P,
-                reprojectionError=2.0
-            )
-
-            if success and inliers is not None and len(inliers) >= 6:
-                R_new, _ = cv2.Rodrigues(rvec)
-                cameras[best_idx] = (R_new, tvec)
-                registered.add(best_idx)
-                print(f"  -> Success. Registered views: {len(registered)}/{len(files)}")
+        if success and inliers is not None and len(inliers) >= 6:
+            R_new, _ = cv2.Rodrigues(rvec)
+            cameras[best_idx] = (R_new, tvec)
+            registered.add(best_idx)
+            print(f"  -> Success. Registered views: {len(registered)}/{len(files)}")
             
             # =============================================================
             #  新規点の三角測量ロジック (ここからが核心部分)
@@ -649,6 +615,72 @@ def run_incremental_sfm(files, K, keypoints, descriptors, imgs, inject_pose_map=
             print(f"  -> PnP failed for view {best_idx}. Stopping.")
             break
             
+    return cameras, points3d, observations
+
+# run_incremental_sfm の直後に追加
+
+def reconstruct_with_sfm_logic_and_fixed_poses(files, K, cameras, keypoints, descriptors):
+    """
+    既知のカメラポーズを使用し、SfMのトラック構築と三角測量ロジックで3D点群を再構成する。
+    """
+    print("[info] Running SfM-based Reconstruction with provided poses.")
+    
+    # 既知ポーズが設定されている画像のインデックスを取得
+    registered_indices = {i for i, cam in enumerate(cameras) if cam is not None}
+    if len(registered_indices) < 2:
+        print("[ERROR] Less than 2 valid poses provided. Cannot reconstruct.")
+        return None, None, None
+
+    # --- SfMモードと同様に、フルトラックを事前に構築 ---
+    print("[info] Matching all pairs to build full tracks...")
+    all_match_dict = {}
+    valid_indices_list = sorted(list(registered_indices))
+    for i in range(len(valid_indices_list)):
+        for j in range(i + 1, len(valid_indices_list)):
+            idx1 = valid_indices_list[i]
+            idx2 = valid_indices_list[j]
+            matches = match_features(descriptors[idx1], descriptors[idx2])
+            if len(matches) > 15:
+                all_match_dict[(idx1, idx2)] = matches
+    
+    print("[info] Building full tracks...")
+    full_tracks = build_tracks(keypoints, all_match_dict)
+    print(f"[info] Found {len(full_tracks)} tracks in total.")
+    
+    # --- トラックに基づいて三角測量を実施 ---
+    points3d = []
+    observations = []
+    
+    print("[info] Triangulating points from tracks...")
+    triangulated_count = 0
+    for track in full_tracks:
+        cams_for_tri, uvs_for_tri = [], []
+        
+        # このトラックが持つ観測のうち、有効なポーズを持つものを収集
+        for img_id, kp_idx in track:
+            if cameras[img_id] is not None:
+                cams_for_tri.append(cameras[img_id])
+                uvs_for_tri.append(np.array(keypoints[img_id][kp_idx].pt))
+        
+        # 2視点以上から観測されていれば三角測量
+        if len(cams_for_tri) >= 2:
+            # 品質チェック付きの三角測量を実行
+            X_new = triangulate_n_views(K, cams_for_tri, uvs_for_tri, 
+                                        min_parallax_deg=1.0,  # SfMモードに近い緩めの閾値
+                                        max_reproj_error_px=2.5)
+            
+            if X_new is not None:
+                points3d.append(X_new)
+                full_obs_list = [(img_id, np.array(keypoints[img_id][kp_idx].pt)) for img_id, kp_idx in track]
+                observations.append(full_obs_list)
+                triangulated_count += 1
+                
+    print(f"  -> Successfully triangulated {triangulated_count} points.")
+    
+    if not points3d:
+        print("[WARN] No 3D points could be triangulated with the given poses and tracks.")
+        return cameras, [], []
+
     return cameras, points3d, observations
 
 def reconstruct_with_fixed_poses(files, K, cameras, keypoints, descriptors):
@@ -874,41 +906,8 @@ def _export_colmap_files(out_dir, files, K_used, cameras):
     print(f"[INFO] Wrote COLMAP txt to: {out_dir}")
 # --------------------------------------------------------------------
 
-def _plot_scene_quick(cameras, points3d):
-    import matplotlib.pyplot as plt
-    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
-    cam_centers = []
-    cam_dirs = []
-    for cam in cameras:
-        if cam is None:
-            cam_centers.append(None); cam_dirs.append(None); continue
-        Rcw, tcw = cam
-        C = -Rcw.T @ tcw  # camera center in world
-        z_cam = Rcw.T @ np.array([[0.0],[0.0],[1.0]])  # camera forward in world
-        cam_centers.append(C.flatten())
-        cam_dirs.append(z_cam.flatten())
-
-    fig = plt.figure()
-    ax = fig.add_subplot(111, projection='3d')
-
-    # points
-    pts = np.array([p for p in points3d if p is not None], dtype=np.float64)
-    if pts.size > 0:
-        ax.scatter(pts[:,0], pts[:,1], pts[:,2], s=1, alpha=0.6)
-
-    # cameras
-    for C, d in zip(cam_centers, cam_dirs):
-        if C is None: continue
-        ax.scatter([C[0]],[C[1]],[C[2]], marker='^', s=20)
-        ax.plot([C[0], C[0]+0.03*d[0]],[C[1], C[1]+0.03*d[1]],[C[2], C[2]+0.03*d[2]], linewidth=1)
-
-    ax.set_xlabel("X"); ax.set_ylabel("Y"); ax.set_zlabel("Z")
-    ax.set_title("Cameras and 3D points (quick look)")
-    plt.show()
-
-
-def main(image_dir, out_dir, poses_path=None, inject_poses_path=None):
+def main(image_dir, out_dir, poses_path=None, mode='sfm'):
     os.makedirs(out_dir, exist_ok=True)
     files = load_images(image_dir)
     if len(files) < 2: 
@@ -940,17 +939,14 @@ def main(image_dir, out_dir, poses_path=None, inject_poses_path=None):
     cameras = [None] * len(files)
     points3d = []
     observations = []
-
     # =================================================================
-    #  モード分岐: ポーズ指定モードか、SfMモードか
-    # =================================================================
-    # =================================================================
-    #  MODE B: Reconstruction with Fixed Poses
+    #  モード分岐
     # =================================================================
     if poses_path:
-        print(f"[info] Running in Fixed Pose Reconstruction mode using {poses_path}")
+        # --- ポーズファイルが指定されている場合のモード ---
+        print(f"[info] Pose file provided: {poses_path}")
         ext_poses = parse_colmap_poses(poses_path)
-        print(f"[info] Loaded {len(ext_poses)} poses.")
+        print(f"[info] Loaded {len(ext_poses)} external poses.")
         
         fname_to_idx = {os.path.basename(f): i for i, f in enumerate(files)}
         for name, pose in ext_poses.items():
@@ -960,32 +956,31 @@ def main(image_dir, out_dir, poses_path=None, inject_poses_path=None):
         num_loaded = sum(1 for c in cameras if c is not None)
         if num_loaded < 2: raise RuntimeError(f"Could not match enough poses. Matched: {num_loaded}")
         print(f"[info] Matched {num_loaded}/{len(files)} poses.")
+
+        if mode == 'fixed_sfm_logic':
+            # --- MODE C: SfMロジック + 固定ポーズ (今回追加) ---
+            cameras, points3d, observations = reconstruct_with_sfm_logic_and_fixed_poses(files, K, cameras, keypoints, descriptors)
+            mode_name = 'FixPoseSfmLogicMode'
         
-        # 新しいロバストな再構成関数を呼び出す
-        points3d, observations = reconstruct_with_fixed_poses(files, K, cameras, keypoints, descriptors)
-        mode_name = 'FixPoseMode'
+        elif mode == 'fixed_robust':
+            # --- MODE B: 既存のロバスト再構成 + 固定ポーズ ---
+            points3d, observations = reconstruct_with_fixed_poses(files, K, cameras, keypoints, descriptors)
+            mode_name = 'FixPoseRobustMode'
+
+        else:
+            print(f"[WARN] Pose file provided, but mode is '{mode}'. Defaulting to 'fixed_sfm_logic'.")
+            cameras, points3d, observations = reconstruct_with_sfm_logic_and_fixed_poses(files, K, cameras, keypoints, descriptors)
+            mode_name = 'FixPoseSfmLogicMode'
 
     else:
-        # =================================================================
-        #  MODE A: Incremental SfM
-        # =================================================================
-        # cameras, points3d, observations = run_incremental_sfm(files, K, keypoints, descriptors, imgs)
-        # 既知ポーズの“注入表”を用意（局所置換用）
-        inject_map = None
-        if inject_poses_path:
-            print(f"[info] Loading poses to inject (for local replacement) from {inject_poses_path}")
-            inject_map = parse_colmap_poses(inject_poses_path)
-            print(f"[info] Prepared {len(inject_map)} poses for possible injection.")
+        # --- MODE A: Incremental SfM (ポーズファイルなし) ---
+        print("[info] No pose file provided. Running in Incremental SfM mode.")
+        cameras, points3d, observations = run_incremental_sfm(files, K, keypoints, descriptors, imgs)
+        mode_name = 'sfmMode'
 
-        cameras, points3d, observations = run_incremental_sfm(
-            files, K, keypoints, descriptors, imgs,
-            inject_pose_map=inject_map
-        )
-        mode_name = 'sfm&Pose_Mode'
-        if cameras is None:
-            print("[ERROR] Incremental SfM failed. Exiting.")
-            sys.exit(1)
-        
+    if cameras is None or observations is None:
+        print("[ERROR] Reconstruction failed in the selected mode. Exiting.")
+        sys.exit(1)        
         # sfm_poses_path = os.path.join(out_dir, "sfm_minimal", "sfm_computed_poses.json")
         # save_poses_to_json(sfm_poses_path, cameras, files)
         
@@ -1015,33 +1010,36 @@ def main(image_dir, out_dir, poses_path=None, inject_poses_path=None):
             json.dump(stats, f, indent=4)
         print(f"[info] Saved detailed metrics to {metrics_path}")
 
-    # quick 3D visualization
-    try:
-        _plot_scene_quick(cameras, points3d)
-    except Exception as e:
-        print(f"[warn] quick visualization failed: {e}")
-
-
     ply_path = os.path.join(out_dir, 'sfm_minimal', f"point_cloud_{mode_name}.ply")
     save_ply(ply_path, points3d, imgs_raw, observations)
     print(f"[INFO] Finished writing outputs to {out_dir}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="A minimal Structure-from-Motion pipeline with two modes.",
+        description="A minimal Structure-from-Motion pipeline with multiple modes.",
         formatter_class=argparse.RawTextHelpFormatter
     )
     parser.add_argument("image_dir", help="Directory containing input images.")
     parser.add_argument("out_dir", help="Directory to save outputs (must contain intrinsics.yaml).")
     parser.add_argument(
         "--poses", 
-        help="Path to a COLMAP images.txt file to use fixed camera poses.\n"
-             "If not provided, the script runs in incremental SfM mode.",
+        help="Path to a COLMAP images.txt file to use fixed camera poses.",
         default=None
     )
     parser.add_argument(
-        "--inject_poses",
-        help="(SfM mode only) Path to COLMAP images.txt whose poses will be LOCALLY injected ONLY for pose estimation steps.",default=None)
+        "--mode",
+        help="Reconstruction mode to use when --poses is provided.\n"
+             " - 'fixed_sfm_logic': (Default with --poses) Use SfM's tracking and triangulation logic.\n"
+             " - 'fixed_robust': Use the robust two-stage reconstruction logic.",
+        choices=['sfm', 'fixed_sfm_logic', 'fixed_robust'],
+        default='sfm'
+    )
     args = parser.parse_args()
 
-    main(args.image_dir, args.out_dir, args.poses, args.inject_poses)
+    # main関数に渡すmodeを決定
+    run_mode = args.mode
+    if args.poses and args.mode == 'sfm':
+        # --posesが指定されたが、modeがデフォルトの'sfm'のままなら、新しいモードを優先する
+        run_mode = 'fixed_sfm_logic'
+
+    main(args.image_dir, args.out_dir, args.poses, run_mode)
