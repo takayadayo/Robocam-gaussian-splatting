@@ -683,6 +683,69 @@ def reconstruct_with_sfm_logic_and_fixed_poses(files, K, cameras, keypoints, des
 
     return cameras, points3d, observations
 
+def reconstruct_from_trusted_poses(files, K, cameras, keypoints, descriptors):
+    """
+    完全に信頼された既知ポーズのみを使い、トラックを構築して三角測量を行う最もシンプルなモード。
+    座標系の不一致問題の切り分けに用いる。
+    """
+    print("[info] Running Reconstruction with Trusted Poses...")
+    
+    # --- Step 1: 全ペアマッチングとトラック構築 ---
+    print("[info] Matching features for all pairs with known poses...")
+    match_dict = {}
+    valid_indices = [i for i, c in enumerate(cameras) if c is not None]
+    if len(valid_indices) < 2:
+        print("[ERROR] Less than 2 valid poses available.")
+        return [], []
+        
+    for i in range(len(valid_indices)):
+        for j in range(i + 1, len(valid_indices)):
+            idx1, idx2 = valid_indices[i], valid_indices[j]
+            matches = match_features(descriptors[idx1], descriptors[idx2])
+            if len(matches) > 15:
+                # Essential Matrixによる検証は行わない。ポーズが正しい前提のため。
+                match_dict[(idx1, idx2)] = matches
+    
+    print("[info] Building full tracks...")
+    full_tracks = build_tracks(keypoints, match_dict)
+    print(f"[info] Found {len(full_tracks)} potential tracks.")
+    if not full_tracks:
+        return [], []
+
+    # --- Step 2: 三角測量 ---
+    print("[info] Triangulating all tracks...")
+    points3d = []
+    observations = []
+    
+    for track in full_tracks:
+        if len(track) < 2:
+            continue
+            
+        cams_for_tri = []
+        uvs_for_tri = []
+        full_obs_list = []
+        
+        for img_id, kp_idx in track:
+            if cameras[img_id] is not None:
+                cams_for_tri.append(cameras[img_id])
+                uv = np.array(keypoints[img_id][kp_idx].pt)
+                uvs_for_tri.append(uv)
+                full_obs_list.append((img_id, uv))
+
+        if len(cams_for_tri) >= 2:
+            # triangulate_n_views を使って品質チェック付きで3D点を計算
+            # 閾値は少し緩めに設定して、まずは点が出るかを確認する
+            X_new = triangulate_n_views(K, cams_for_tri, uvs_for_tri, 
+                                        min_parallax_deg=1.0,  # 視差の閾値を少し下げる
+                                        max_reproj_error_px=4.0) # 再投影誤差の閾値を少し上げる
+            
+            if X_new is not None:
+                points3d.append(X_new)
+                observations.append(full_obs_list)
+
+    print(f"[info] Successfully reconstructed {len(points3d)} points.")
+    return points3d, observations
+
 def reconstruct_with_fixed_poses(files, K, cameras, keypoints, descriptors):
     """
     固定されたカメラポーズを用いて、ロバストな2段階三角測量により3D点群を再構成する。
@@ -959,8 +1022,8 @@ def main(image_dir, out_dir, poses_path=None, mode='sfm'):
     if K_loaded is None: 
         raise RuntimeError(f"Failed to load intrinsics from {intrinsics_path}")
     
-    imgs, K_undistort = undistort_images(imgs_raw, K_loaded, dist_loaded)
-    K = K_undistort if K_undistort is not None else K_loaded
+    imgs = imgs_raw
+    K = K_loaded
     print(f"[info] Using intrinsics from {intrinsics_path}")
 
     print("[info] Extracting features...")
@@ -995,10 +1058,10 @@ def main(image_dir, out_dir, poses_path=None, mode='sfm'):
             cameras, points3d, observations = reconstruct_with_sfm_logic_and_fixed_poses(files, K, cameras, keypoints, descriptors)
             mode_name = 'FixPoseSfmLogicMode'
         
-        elif mode == 'fixed_robust':
-            # --- MODE B: 既存のロバスト再構成 + 固定ポーズ ---
-            points3d, observations = reconstruct_with_fixed_poses(files, K, cameras, keypoints, descriptors)
-            mode_name = 'FixPoseRobustMode'
+        elif mode == 'fixed_robust': # この部分を 'fixed_trusted' など新しい名前に変えても良い
+            # --- MODE D: Trusted Pose Reconstruction (今回のテスト用) ---
+            points3d, observations = reconstruct_from_trusted_poses(files, K, cameras, keypoints, descriptors)
+            mode_name = 'FixPoseTrustedMode'
 
         else:
             print(f"[WARN] Pose file provided, but mode is '{mode}'. Defaulting to 'fixed_sfm_logic'.")
