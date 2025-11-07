@@ -36,7 +36,7 @@ SQUARES_Y = 5
 SQUARE_LEN_MM = 32.0
 MARKER_LEN_MM = 24.0
 DICT = cv2.aruco.DICT_4X4_50
-EULER_ORDER = "xyz"
+EULER_ORDER = "XYZ"
 MIN_CORNERS = 20
 PNP_FLAG = cv2.SOLVEPNP_SQPNP
 REPROJ_REJECT_PX = 2.5
@@ -469,13 +469,31 @@ def run_handeye(captures: List[Capture], target2cam_list: List[Optional[Tuple[np
     )
     return R_cam2gripper, t_cam2gripper
 
-
 def compose_base_to_cam(caps: List[Capture], Rg_c: np.ndarray, tg_c: np.ndarray):
+    # 修正点 2: 確定したロボット座標系からCV座標系への正規化回転
+    # Robot(X:fwd, Y:left, Z:up) -> CV(X:right, Y:down, Z:fwd)
+    R_cv_robot = np.array([
+        [ 0, -1,  0],
+        [ 0,  0, -1],
+        [ 1,  0,  0]
+    ], dtype=np.float64)
+    
+    print("\n[INFO] Applying finalized coordinate system normalization:")
+    print(R_cv_robot)
+
     Tbc_list = []
     for cap in caps:
-        Rb_g, tb_g = cap.Rb_g, cap.tb_g        
-        Rb_c = Rb_g @ Rg_c
-        tb_c = Rb_g @ tg_c + tb_g
+        Rb_g, tb_g = cap.Rb_g, cap.tb_g
+        
+        # 1. ロボットのポーズ(Rb_g, tb_g)をCV互換のワールド座標系に変換
+        R_base_cv_g = R_cv_robot @ Rb_g
+        t_base_cv_g = R_cv_robot @ tb_g
+        
+        # 2. CV座標系に統一された上で、ハンドアイ変換と合成
+        # T_base(cv)_camera = T_base(cv)_gripper(cv) * T_gripper_camera
+        Rb_c = R_base_cv_g @ Rg_c
+        tb_c = R_base_cv_g @ tg_c + t_base_cv_g
+
         Tbc_list.append((Rb_c, tb_c))
     return Tbc_list
 

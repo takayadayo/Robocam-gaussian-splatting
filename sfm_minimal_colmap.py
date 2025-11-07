@@ -1022,8 +1022,8 @@ def main(image_dir, out_dir, poses_path=None, mode='sfm'):
     if K_loaded is None: 
         raise RuntimeError(f"Failed to load intrinsics from {intrinsics_path}")
     
-    imgs = imgs_raw
-    K = K_loaded
+    imgs, K_undistort = undistort_images(imgs_raw, K_loaded, dist_loaded)
+    K = K_undistort if K_undistort is not None else K_loaded
     print(f"[info] Using intrinsics from {intrinsics_path}")
 
     print("[info] Extracting features...")
