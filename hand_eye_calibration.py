@@ -66,6 +66,21 @@ def pose_json_to_matrix(pose):
     T[0:3, 3] = t_vec
     return T
 
+def base_pose_json_to_matrix(pose):
+    """
+    【ベースライン】JSONポーズを最もシンプルに変換する
+    """
+    t_vec = np.array([pose['x_mm'], pose['y_mm'], pose['z_mm']])
+    rx = pose['rx_deg']
+    ry = pose['ry_deg']
+    rz = pose['rz_deg']
+    r_obj = Rotation.from_euler('zyx', [rz, ry, rx], degrees=True)
+    r_mat = r_obj.as_matrix()
+    T = np.eye(4)
+    T[0:3, 0:3] = r_mat
+    T[0:3, 3] = t_vec
+    return T
+
 def visualize_robot_trajectory(json_data):
     """
     JSONデータからロボットアーム先端の軌道を可視化する。
@@ -214,128 +229,185 @@ def validate_calibration(R_base_ee_list, t_base_ee_list, R_cam_board_list, t_cam
 
     return T_base_board_list
 
+def systematic_validation(json_data, image_files, board, camera_matrix, dist_coeffs):
+    """
+    JSONポーズと計算カメラポーズの相対関係を比較し、座標系解釈を体系的に検証する
+    """
+    print("\n--- Systematic Validation: Analyzing Pose Consistency ---")
+
+    # --- Step 1: 必要なポーズリストを準備 ---
+    json_map = {item['image_file']: item for item in json_data['captures']}
+    
+    # 有効だった画像ファイル名と、それに対応するポーズ情報を格納
+    valid_filenames = []
+    T_base_ee_list = [] # JSONから読み取ったアーム先端ポーズ
+    T_cam_board_list = [] # 画像から推定したボードのポーズ
+
+    for img_file in image_files:
+        filename = img_file.split('/')[-1].split('\\')[-1]
+        if filename not in json_map:
+            continue
+        
+        img = cv2.imread(img_file)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        corners, ids, _ = cv2.aruco.detectMarkers(gray, DICTIONARY)
+        if ids is None or len(ids) <= 4:
+            continue
+            
+        retval, charuco_corners, charuco_ids = cv2.aruco.interpolateCornersCharuco(
+            corners, ids, gray, board)
+        if not (retval and charuco_corners is not None and len(charuco_corners) > 4):
+            continue
+            
+        pose_found, rvec, tvec = cv2.aruco.estimatePoseCharucoBoard(
+            charuco_corners, charuco_ids, board, camera_matrix, dist_coeffs, None, None, useExtrinsicGuess=False)
+
+        if pose_found:
+            valid_filenames.append(filename)
+            # 現在の最善の解釈でアームポーズを変換
+            T_base_ee_list.append(base_pose_json_to_matrix(json_map[filename]['pose']))
+            
+            # カメラから見たボードのポーズ
+            T_cam_board = np.eye(4)
+            T_cam_board[0:3, 0:3], _ = cv2.Rodrigues(rvec)
+            T_cam_board[0:3, 3] = tvec.flatten()
+            T_cam_board_list.append(T_cam_board)
+    
+    # --- Step 2: 上記データでHand-Eyeキャリブレーションを実行 ---
+    R_base_ee_list = [T[0:3, 0:3] for T in T_base_ee_list]
+    t_base_ee_list = [T[0:3, 3] for T in T_base_ee_list]
+    R_cam_board_list = [T[0:3, 0:3] for T in T_cam_board_list]
+    t_cam_board_list = [T[0:3, 3] for T in T_cam_board_list]
+
+    R_ee_cam, t_ee_cam = cv2.calibrateHandEye(
+        R_base_ee_list, t_base_ee_list, R_cam_board_list, t_cam_board_list, 
+        method=cv2.CALIB_HAND_EYE_PARK)
+
+    T_ee_cam = np.eye(4)
+    T_ee_cam[0:3, 0:3] = R_ee_cam
+    T_ee_cam[0:3, 3] = t_ee_cam.flatten()
+
+    # --- Step 3: 各画像での相対ポーズ T_ee_cam_i を計算し、ばらつきを評価 ---
+    T_ee_cam_individual_list = []
+    T_base_cam_list = []
+
+    # まず、ロボットベースから見たボードのポーズを平均化して基準とする
+    T_base_board_list = []
+    for i in range(len(T_base_ee_list)):
+        T_base_board = T_base_ee_list[i] @ T_ee_cam @ T_cam_board_list[i]
+        T_base_board_list.append(T_base_board)
+    
+    translations = np.array([T[0:3, 3] for T in T_base_board_list])
+    rotations_obj = Rotation.from_matrix([T[0:3, 0:3] for T in T_base_board_list])
+    T_base_board_avg = np.eye(4)
+    T_base_board_avg[0:3, 3] = np.mean(translations, axis=0)
+    T_base_board_avg[0:3, 0:3] = rotations_obj.mean().as_matrix()
+
+    # 各視点でのカメラポーズを計算
+    for i in range(len(T_base_ee_list)):
+        # T_base_cam = T_base_board * (T_cam_board)^-1
+        T_base_cam = T_base_board_avg @ np.linalg.inv(T_cam_board_list[i])
+        T_base_cam_list.append(T_base_cam)
+
+        # 本題：各視点での相対ポーズを計算
+        # T_ee_cam_i = (T_base_ee_i)^-1 * T_base_cam
+        T_ee_cam_i = np.linalg.inv(T_base_ee_list[i]) @ T_base_cam
+        T_ee_cam_individual_list.append(T_ee_cam_i)
+        
+    # --- Step 4: 結果の定量化と分析 ---
+    translations = np.array([T[0:3, 3] for T in T_ee_cam_individual_list])
+    rotations_obj = Rotation.from_matrix([T[0:3, 0:3] for T in T_ee_cam_individual_list])
+
+    mean_translation = np.mean(translations, axis=0)
+    std_translation = np.std(translations, axis=0)
+    
+    mean_rotation_obj = rotations_obj.mean()
+    dev_angles_deg = []
+    for r_obj in rotations_obj:
+        delta_rot = r_obj * mean_rotation_obj.inv()
+        angle_rad = np.linalg.norm(delta_rot.as_rotvec())
+        dev_angles_deg.append(np.rad2deg(angle_rad))
+        
+    mean_dev_angle = np.mean(dev_angles_deg)
+    std_dev_angle = np.std(dev_angles_deg)
+
+    print("\n[Analysis of T_endeffector_to_camera Consistency]")
+    print(f"Mean Translation (x,y,z): {mean_translation}")
+    print(f"Std Deviation [mm]: {std_translation} <-- THIS IS THE KEY METRIC FOR TRANSLATION")
+    print(f"Mean Angular Deviation [deg]: {mean_dev_angle:.4f}")
+    print(f"Std Dev Angular Deviation [deg]: {std_dev_angle:.4f} <-- THIS IS THE KEY METRIC FOR ROTATION")
+
+    # 課題の診断
+    print("\n[Diagnostic Insights]")
+    if std_dev_angle > 2.0:
+        print("- ROTATION interpretation is likely INCORRECT. (Euler order, sign, etc.)")
+    else:
+        print("- ROTATION interpretation is likely CORRECT. (StdDev < 2.0 deg)")
+
+    if np.any(std_translation > 10.0):
+        print("- TRANSLATION interpretation is likely INCORRECT. (Axis mapping, sign, etc.)")
+    else:
+        print("- TRANSLATION interpretation is likely CORRECT. (StdDev < 10.0 mm)")
+        
+    # --- Step 5: 可視化 ---
+    print("\nVisualizing calculated camera poses vs. JSON end-effector poses...")
+    fig = plt.figure(figsize=(12, 6))
+    
+    # 左: JSONのアーム先端ポーズ
+    ax1 = fig.add_subplot(121, projection='3d')
+    ax1.set_title("Robot End-Effector Poses (from JSON)")
+    for T in T_base_ee_list:
+        draw_axis(ax1, T, scale=50)
+    
+    # 右: 計算されたカメラポーズ
+    ax2 = fig.add_subplot(122, projection='3d')
+    ax2.set_title("Calculated Camera Poses")
+    for T in T_base_cam_list:
+        draw_axis(ax2, T, scale=50)
+    
+    # 範囲を揃える
+    all_points = np.vstack([T[0:3, 3] for T in T_base_ee_list] + [T[0:3, 3] for T in T_base_cam_list])
+    x_min, y_min, z_min = all_points.min(axis=0)
+    x_max, y_max, z_max = all_points.max(axis=0)
+    ax1.set_xlim(x_min, x_max); ax1.set_ylim(y_min, y_max); ax1.set_zlim(z_min, z_max)
+    ax2.set_xlim(x_min, x_max); ax2.set_ylim(y_min, y_max); ax2.set_zlim(z_min, z_max)
+    ax1.set_xlabel("X"); ax1.set_ylabel("Y"); ax1.set_zlabel("Z")
+    ax2.set_xlabel("X"); ax2.set_ylabel("Y"); ax2.set_zlabel("Z")
+    
+    plt.tight_layout()
+    plt.show()
+
 def main(image_dir, json_path):
     # --- 1. データ準備 ---
     image_files = glob.glob(f"{image_dir}/*.png")
     with open(json_path, 'r') as f:
         json_data = json.load(f)
-    visualize_robot_trajectory(json_data)
-    # ChArUcoボードオブジェクトを作成
-    # board = cv2.aruco.CharucoBoard_create(SQUARES_X, SQUARES_Y, SQUARE_LEN_MM, MARKER_LEN_MM, DICTIONARY)
-    # OpenCV 4.7.0 のAPI
+    
     board = cv2.aruco.CharucoBoard((SQUARES_X, SQUARES_Y), SQUARE_LEN_MM, MARKER_LEN_MM, DICTIONARY)
 
-    print("--- 1. Detecting ChArUco markers ---")
-    all_charuco_corners = []
-    all_charuco_ids = []
+    # --- 2. カメラ内部パラメータのキャリブレーション ---
+    print("--- Calibrating camera intrinsics ---")
+    # (この部分は変更なし)
+    all_charuco_corners, all_charuco_ids = [], []
     image_size = None
-
+    # ... (カメラキャリブレーションのコード) ...
     for img_file in image_files:
         img = cv2.imread(img_file)
-        if image_size is None:
-            image_size = img.shape[:2][::-1] # (width, height)
-        
+        if image_size is None: image_size = img.shape[:2][::-1]
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         corners, ids, _ = cv2.aruco.detectMarkers(gray, DICTIONARY)
-        
         if ids is not None:
             retval, charuco_corners, charuco_ids = cv2.aruco.interpolateCornersCharuco(
                 corners, ids, gray, board)
             if retval:
                 all_charuco_corners.append(charuco_corners)
                 all_charuco_ids.append(charuco_ids)
-
-    print(f"Found markers in {len(all_charuco_corners)} / {len(image_files)} images.")
-
-# --- 2. カメラ内部パラメータのキャリブレーション ---
-    print("\n--- 2. Calibrating camera intrinsics ---")
-    # camera_matrix と dist_coeffs をゼロから算出するため、
-    # CALIB_USE_INTRINSIC_GUESS フラグは使用しない。
-    # flags引数を省略するか、0を指定する。
-    ret, camera_matrix, dist_coeffs, rvecs, tvecs = cv2.aruco.calibrateCameraCharuco(
+    ret, camera_matrix, dist_coeffs, _, _ = cv2.aruco.calibrateCameraCharuco(
         all_charuco_corners, all_charuco_ids, board, image_size, None, None)
+    print(f"Intrinsics calibrated. Reprojection Error: {ret:.4f}")
 
-    print("Camera calibration successful.")
-    print("Camera Matrix:\n", camera_matrix)
-    print("Distortion Coefficients:\n", dist_coeffs)
-    print(f"Reprojection Error: {ret}")
-
-
-    # --- 3. Hand-Eyeキャリブレーションのためのポーズ準備 ---
-    R_base_ee, t_base_ee, R_cam_board, t_cam_board = estimate_all_poses(
-        image_files, json_data, board, camera_matrix, dist_coeffs)
-
-    # --- 4. Hand-Eyeキャリブレーション実行 ---
-    print("\n--- 4. Performing Hand-Eye calibration ---")
-    # OpenCVは回転ベクトルと並進ベクトルを別々に要求する
-    # メソッドは複数あるが、ここではPARK法を使用する
-    R_ee_cam, t_ee_cam = cv2.calibrateHandEye(
-        R_base_ee, t_base_ee, R_cam_board, t_cam_board, 
-        method=cv2.CALIB_HAND_EYE_PARK)
-
-    print("Hand-Eye calibration successful.")
-    print("End-effector to Camera Rotation Matrix:\n", R_ee_cam)
-    print("End-effector to Camera Translation Vector (mm):\n", t_ee_cam.flatten())
-    
-    # Hand-Eye変換行列 (同次)
-    T_ee_cam = np.eye(4)
-    T_ee_cam[0:3, 0:3] = R_ee_cam
-    T_ee_cam[0:3, 3] = t_ee_cam.flatten()
-    print("Hand-Eye Homogeneous Transformation Matrix (T_endeffector_to_camera):\n", T_ee_cam)
-
-
-    # --- 5. 定量的検証 ---
-    T_base_board_list = validate_calibration(R_base_ee, t_base_ee, R_cam_board, t_cam_board, R_ee_cam, t_ee_cam)
-
-
-    # --- 6. 可視化 ---
-    print("\n--- 6. Visualizing results ---")
-    fig = plt.figure(figsize=(10, 10))
-    ax = fig.add_subplot(111, projection='3d')
-
-    # ボードの平均ポーズを計算して描画
-    translations = np.array([T[0:3, 3] for T in T_base_board_list])
-    rotations_obj = Rotation.from_matrix([T[0:3, 0:3] for T in T_base_board_list])
-    mean_translation = np.mean(translations, axis=0)
-    mean_rotation_mat = rotations_obj.mean().as_matrix()
-    
-    T_base_board_avg = np.eye(4)
-    T_base_board_avg[0:3, 3] = mean_translation
-    T_base_board_avg[0:3, 0:3] = mean_rotation_mat
-    
-    print("Drawing average board pose.")
-    draw_axis(ax, T_base_board_avg, scale=100) # ボードは大きく表示
-    ax.text(mean_translation[0], mean_translation[1], mean_translation[2], "Charuco Board")
-
-    # 各カメラポーズを計算して描画
-    print("Drawing camera poses.")
-    for i in range(len(R_base_ee)):
-        T_base_ee = np.eye(4)
-        T_base_ee[0:3, 0:3] = R_base_ee[i]
-        T_base_ee[0:3, 3] = t_base_ee[i]
-
-        # T_base->cam = T_base->ee * T_ee->cam
-        T_base_cam = T_base_ee @ T_ee_cam
-        
-        draw_axis(ax, T_base_cam, scale=50)
-
-    # プロット範囲の設定
-    all_points = np.vstack(([T[0:3,3] for T in T_base_board_list]))
-    max_range = np.array([all_points[:,0].max()-all_points[:,0].min(), 
-                          all_points[:,1].max()-all_points[:,1].min(), 
-                          all_points[:,2].max()-all_points[:,2].min()]).max() / 2.0
-    mid_x = (all_points[:,0].max()+all_points[:,0].min()) * 0.5
-    mid_y = (all_points[:,1].max()+all_points[:,1].min()) * 0.5
-    mid_z = (all_points[:,2].max()+all_points[:,2].min()) * 0.5
-    ax.set_xlim(mid_x - max_range, mid_x + max_range)
-    ax.set_ylim(mid_y - max_range, mid_y + max_range)
-    ax.set_zlim(mid_z - max_range, mid_z + max_range)
-    
-    ax.set_xlabel("X (mm)")
-    ax.set_ylabel("Y (mm)")
-    ax.set_zlabel("Z (mm)")
-    ax.set_title("Hand-Eye Calibration Result")
-    plt.show()
+    # --- 3. 新しい体系的検証を実行 ---
+    systematic_validation(json_data, image_files, board, camera_matrix, dist_coeffs)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Perform Hand-Eye calibration.')
