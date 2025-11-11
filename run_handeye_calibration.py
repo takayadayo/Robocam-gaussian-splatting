@@ -266,6 +266,59 @@ def visualize_camera_poses(gripper_poses, T_cam2gripper, board_poses):
     plt.tight_layout()
     plt.show()
 
+def mat_to_colmap_qvec_tvec(Rwc_inv, twc_inv):
+    """
+    入力：World->Camera への回転行列 Rcw（= Rwc_inv）と並進 tcw（= twc_inv）
+    COLMAPは Hamilton 規約の (qw, qx, qy, qz) を要求。
+    scipy Rotation.as_quat() は (x, y, z, w) を返すため順番を入れ替える。
+    """
+    from scipy.spatial.transform import Rotation as R
+    q_xyzw = R.from_matrix(Rwc_inv).as_quat()  # [qx, qy, qz, qw]
+    qx, qy, qz, qw = q_xyzw
+    return (float(qw), float(qx), float(qy), float(qz),
+            float(twc_inv[0]), float(twc_inv[1]), float(twc_inv[2]))
+
+def write_colmap_images_txt(out_path, image_files, valid_indices,
+                            gripper_poses, T_cam2gripper,
+                            camera_id=1, image_id_start=1):
+    """
+    COLMAP images.txt を書き出す。
+    - image_files: すべての画像パス（sorted）
+    - valid_indices: Charuco検出に成功したインデックス列（可視化と同じ並び）
+    - gripper_poses: valid_indicesに対応した T_gb（グリッパ→ベース）同次行列のリスト
+    - T_cam2gripper: カメラ→グリッパ同次行列
+    出力は、行1: IMAGE_ID QW QX QY QZ TX TY TZ CAMERA_ID NAME
+             行2: （POINTS2D；今回は空行）
+    注意：COLMAPは World->Camera の (R,t) を期待。可視化の T_camera_world は Camera->World。
+    よって (Camera->World) の逆行列を取って World->Camera を作る。
+    """
+    lines = []
+    lines.append("# Image list with two lines of data per image:")
+    lines.append("#   IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME")
+    lines.append("#   POINTS2D[] as (X, Y, POINT3D_ID)")
+
+    # 可視化と同じ：T_camera_world = T_gb @ T_cam2gripper  （= Camera->World）
+    image_id = int(image_id_start)
+    for local_idx, gi in enumerate(valid_indices):
+        img_name = image_files[gi] if isinstance(image_files[gi], str) else str(image_files[gi])
+        T_gb = gripper_poses[local_idx]
+        T_cw = T_gb @ T_cam2gripper           # Camera->World
+        T_wc = np.linalg.inv(T_cw)            # World->Camera
+        R_wc = T_wc[:3, :3]
+        t_wc = T_wc[:3, 3]
+
+        qw, qx, qy, qz, tx, ty, tz = mat_to_colmap_qvec_tvec(R_wc, t_wc)
+        # Windows でもモデル内の相対パス風にしたい場合は basename にする
+        name = img_name
+
+        head = f"{image_id} {qw:.10g} {qx:.10g} {qy:.10g} {qz:.10g} {tx:.10g} {ty:.10g} {tz:.10g} {camera_id} {name}"
+        lines.append(head)
+        lines.append("")  # 2D対応は未出力
+        image_id += 1
+
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    print(f"[WRITE] images.txt -> {out_path}")
 
 def main():
     parser = argparse.ArgumentParser(description='ChArUco Hand-Eye Calibration')
@@ -276,7 +329,12 @@ def main():
     parser.add_argument('--square-length', type=float, default=32.0, help='正方形のサイズ(mm)')
     parser.add_argument('--marker-length', type=float, default=24.0, help='マーカーのサイズ(mm)')
     parser.add_argument('--dict', type=str, default='4X4_50', help='ArUco辞書 (4X4_50, 5X5_100等)')
-    
+    parser.add_argument('--images-txt-out', type=str, default=None,
+                        help='COLMAP images.txt の出力先パス')
+    parser.add_argument('--camera-id', type=int, default=1,
+                        help='images.txt に書く CAMERA_ID（cameras.txt と整合させる）')
+    parser.add_argument('--image-id-start', type=int, default=1,
+                        help='images.txt の IMAGE_ID の開始番号')
     args = parser.parse_args()
     
     # ArUco辞書とChArUcoボードを作成
@@ -344,7 +402,13 @@ def main():
     visualize_camera_poses(gripper_poses, T_cam2gripper, board_poses)
     
     print("\n処理完了!")
-
+    # 6. COLMAP images.txt を出力（任意）
+    if args.images_txt_out:
+        # 可視化と同じ並び（valid_indicesに対応）で書き出す
+        write_colmap_images_txt(args.images_txt_out, image_files, valid_indices,
+                                gripper_poses, T_cam2gripper,
+                                camera_id=args.camera_id,
+                                image_id_start=args.image_id_start)
 
 if __name__ == '__main__':
     main()
