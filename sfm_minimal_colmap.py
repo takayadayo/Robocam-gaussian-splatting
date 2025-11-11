@@ -960,6 +960,7 @@ def main(image_dir, out_dir, poses_path=None, mode='sfm'):
         raise RuntimeError(f"Failed to load intrinsics from {intrinsics_path}")
     
     imgs, K_undistort = undistort_images(imgs_raw, K_loaded, dist_loaded)
+    imgs = imgs_raw
     K = K_undistort if K_undistort is not None else K_loaded
     print(f"[info] Using intrinsics from {intrinsics_path}")
 

@@ -148,8 +148,8 @@ def plot_poses(poses, scale=0.2, show_labels=False, figsize=(10,8)):
 
         ax.scatter([C[0]], [C[1]], [C[2]], marker='o', s=20)
         ax.plot([C[0], C[0] + scale * x_axis[0]], [C[1], C[1] + scale * x_axis[1]], [C[2], C[2] + scale * x_axis[2]], linewidth=1)
-        ax.plot([C[0], C[0] + scale * y_axis[0]], [C[1], C[1] + scale * y_axis[1]], [C[2], C[2] + scale * y_axis[2]], linewidth=1)
-        ax.plot([C[0], C[0] + scale * z_axis[0]], [C[1], C[1] + scale * z_axis[1]], [C[2], C[2] + scale * z_axis[2]], linewidth=1)
+        ax.plot([C[0], C[0] + scale * y_axis[0]], [C[1], C[1] + scale * y_axis[1]], [C[2], C[2] + scale * y_axis[2]], linewidth=5)
+        ax.plot([C[0], C[0] + scale * z_axis[0]], [C[1], C[1] + scale * z_axis[1]], [C[2], C[2] + scale * z_axis[2]], linewidth=10)
 
         # approximate frustum
         w = scale * 0.4; h = scale * 0.3
