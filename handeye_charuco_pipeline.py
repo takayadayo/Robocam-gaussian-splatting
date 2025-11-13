@@ -559,6 +559,10 @@ def reconstruct_charuco_points_in_base(
         T_b_g = pose_to_T_base_gripper(robot_poses[img_name])
         # base->camera = base->gripper * gripper->camera
         T_b_c = T_b_g @ T_g_c
+        
+        T_c_b = np.linalg.inv(T_b_c)
+        R_cb, t_cb = T_to_R_t(T_c_b)
+        
         R_bc, t_bc = T_to_R_t(T_b_c)
 
         # 画像座標 -> 正規化座標 (undistort)
@@ -570,7 +574,7 @@ def reconstruct_charuco_points_in_base(
             u, v = undistorted[idx, 0, :]  # 正規化座標
             if cid not in id_to_measurements:
                 id_to_measurements[cid] = []
-            id_to_measurements[cid].append((u, v, R_bc, t_bc))
+            id_to_measurements[cid].append((u, v, R_cb, t_cb))
 
         T_base_cam_list.append(T_b_c)
         used_image_paths.append(img_path)
@@ -598,7 +602,7 @@ def reconstruct_charuco_points_in_base(
         reproj_errors = []
         for (u, v, R_bc, t_bc) in meas_list:
             # 正規化座標系で投影
-            X_cam = R_bc @ Xb.reshape(3, 1) + t_bc  # 3x1
+            X_cam = R_cb @ Xb.reshape(3, 1) + t_cb  # 3x1
             x_proj = X_cam[0, 0] / X_cam[2, 0]
             y_proj = X_cam[1, 0] / X_cam[2, 0]
             err = np.sqrt((x_proj - u) ** 2 + (y_proj - v) ** 2)
@@ -609,9 +613,9 @@ def reconstruct_charuco_points_in_base(
         # ここでは閾値を「正規化空間の誤差」で扱う:
         # だいたい u,v ~ x/z なので、1px ~ 1/fx と見なすと、この閾値は ~1/fx オーダ。
         # fx ~ 900 のとき、1px ≈ 1/900 ≈ 0.0011 なので、ざっくり 0.002〜0.003 程度を「1〜3px 程度」と見なせる。
-        if rms_err > max_reproj_error_px / K[0, 0]:
-            # 外れ値ぽいのでスキップ
-            continue
+        # if rms_err > max_reproj_error_px / K[0, 0]:
+        #     # 外れ値ぽいのでスキップ
+        #     continue
 
         id_to_Xb[cid] = Xb
         all_reproj_errors.extend(reproj_errors)
@@ -633,7 +637,13 @@ def reconstruct_charuco_points_in_base(
         if img is not None and img_name in robot_poses:
             T_b_g = pose_to_T_base_gripper(robot_poses[img_name])
             T_b_c = T_b_g @ T_g_c
+            
+            T_c_b = np.linalg.inv(T_b_c)
+            R_cb, t_cb = T_to_R_t(T_c_b)
+            
             R_bc, t_bc = T_to_R_t(T_b_c)
+            
+            rvec_cb, _ = cv2.Rodrigues(R_cb)
 
             # base->camera 外部と K, dist から reproject
             for cid, Xb in id_to_Xb.items():
@@ -647,8 +657,8 @@ def reconstruct_charuco_points_in_base(
                 # ここで再度 distort をかけて画像座標へ
                 uv_dist = cv2.projectPoints(
                     Xb.reshape(1, 3).astype(np.float32),
-                    cv2.Rodrigues(R_bc)[0],
-                    t_bc.astype(np.float32),
+                    rvec_cb,
+                    t_cb.astype(np.float32),
                     K,
                     dist
                 )[0]
