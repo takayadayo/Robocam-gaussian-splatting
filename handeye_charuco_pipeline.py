@@ -150,7 +150,7 @@ def evaluate_euler_order(
         T_b_g = pose_to_T_base_gripper(robot_poses[img_name], euler_order=euler_order)
 
         # base->camera
-        T_b_c = T_b_g @ T_c_g
+        T_b_c = T_b_g @ T_g_c
 
         # camera->board (calibrateCamera の rvec, tvec は object->camera)
         R_cb, _ = cv2.Rodrigues(rvecs[i])
@@ -558,7 +558,7 @@ def reconstruct_charuco_points_in_base(
         # base->gripper
         T_b_g = pose_to_T_base_gripper(robot_poses[img_name])
         # base->camera = base->gripper * gripper->camera
-        T_b_c = T_b_g @ T_c_g
+        T_b_c = T_b_g @ T_g_c
         R_bc, t_bc = T_to_R_t(T_b_c)
 
         # 画像座標 -> 正規化座標 (undistort)
@@ -632,7 +632,7 @@ def reconstruct_charuco_points_in_base(
         img = cv2.imread(img_path)
         if img is not None and img_name in robot_poses:
             T_b_g = pose_to_T_base_gripper(robot_poses[img_name])
-            T_b_c = T_b_g @ T_c_g
+            T_b_c = T_b_g @ T_g_c
             R_bc, t_bc = T_to_R_t(T_b_c)
 
             # base->camera 外部と K, dist から reproject
@@ -724,7 +724,7 @@ def visualize_poses_3d(
         # base->camera = base->gripper * gripper->camera
         # gripper->camera は camera->gripper の逆
         T_c_g = np.linalg.inv(T_g_c)
-        T_b_c = T_b_g @ T_c_g
+        T_b_c = T_b_g @ T_g_c
 
         gripper_centers.append(T_b_g[:3, 3])
         camera_centers.append(T_b_c[:3, 3])
