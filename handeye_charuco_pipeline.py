@@ -33,10 +33,12 @@ from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 (for 3D)
 # ---------------------------------------------------------------
 def euler_extrinsic_to_R(rx_deg, ry_deg, rz_deg, order="XYZ"):
     """
-    世界座標系の X,Y,Z 軸まわりの外部回転 (deg) を、指定された順序で合成して回転行列を返す。
+    世界座標系の X,Y,Z 軸まわりの外因性回転 (deg) を、
+    指定された順序で合成して回転行列を返す。
 
-    order: 文字列 "XYZ", "XZY", "YXZ", "YZX", "ZXY", "ZYX" のいずれか。
-           例: order="ZYX" の場合、R = Rz(rz) * Ry(ry) * Rx(rx)
+    order: "XYZ", "XZY", "YXZ", "YZX", "ZXY", "ZYX"
+           例: "XYZ" の場合 R = Rz(rz) * Ry(ry) * Rx(rx)
+           （Yaskawa の Pose Format と整合させるなら "XYZ"）
     """
     rx, ry, rz = np.deg2rad([rx_deg, ry_deg, rz_deg])
 
@@ -58,28 +60,29 @@ def euler_extrinsic_to_R(rx_deg, ry_deg, rz_deg, order="XYZ"):
                          [sa,  ca, 0],
                          [ 0,   0, 1]], dtype=np.float64)
 
-    R_map = {
-        "X": Rx(rx),
-        "Y": Ry(ry),
-        "Z": Rz(rz),
-    }
+    Rx_m = Rx(rx)
+    Ry_m = Ry(ry)
+    Rz_m = Rz(rz)
 
+    R_map = {"X": Rx_m, "Y": Ry_m, "Z": Rz_m}
+
+    # 外因性: fixed axes なので、右から掛けていく
     R = np.eye(3, dtype=np.float64)
-    # 右から掛けていく（外部回転: fixed axes）
     for ax in order:
         R = R_map[ax] @ R
 
     return R
 
+
 def pose_to_T_base_gripper(pose_dict, euler_order="XYZ"):
     """
-    JSON の pose から base->gripper (フランジ中心) 同次変換 T_b_g を生成。
-    euler_order: "XYZ", "ZYX" など。実機仕様が確定したら固定。
+    JSONの pose から base->gripper (フランジ中心) の同次変換 T_b_g を生成。
 
-    x_mm, y_mm, z_mm: 世界座標系での制御点（フランジ中心）位置 [mm]
-    rx_deg, ry_deg, rz_deg: 世界座標系 XYZ 軸まわりの外部回転 [deg]
+    - x_mm, y_mm, z_mm : ベース座標系でのフランジ中心(TCP)位置 [mm]
+    - rx_deg, ry_deg, rz_deg : ベース座標系 XYZ 軸まわりの外因性回転 [deg]
+      （YaskawaのRECTAN/BASEポーズと整合）
     """
-    x = pose_dict["x_mm"] * 1e-3  # m
+    x = pose_dict["x_mm"] * 1e-3  # [m]
     y = pose_dict["y_mm"] * 1e-3
     z = pose_dict["z_mm"] * 1e-3
 
@@ -209,6 +212,19 @@ def T_to_R_t(T):
     t = T[:3, 3].reshape(3, 1).copy()
     return R, t
 
+def base_to_cam_to_world_to_cam(T_b_c):
+    """
+    base->camera (^bT_c) から world(=base)->camera (^cT_b) を得る。
+
+        X_b = ^bR_c X_c + ^b t_c
+        <=> X_c = ^cR_b X_b + ^c t_b
+
+    なので ^cR_b = (^bR_c)^T,  ^c t_b = -(^bR_c)^T ^b t_c
+    """
+    R_b_c, t_b_c = T_to_R_t(T_b_c)  # ^bR_c, ^bt_c
+    R_c_b = R_b_c.T
+    t_c_b = -R_c_b @ t_b_c
+    return R_c_b, t_c_b
 
 # ---------------------------------------------------------------
 # Charuco ボード & 検出
@@ -379,110 +395,93 @@ def collect_charuco_and_robot_pairs(
 
 def calibrate_intrinsics(obj_points_all, img_points_all, image_size):
     """
-    Charuco コーナ群からカメラ行列 K と歪み dist を推定。
-    OpenCV の標準関数 calibrateCamera を利用する。
+    Charuco から得た 3D-2D 対応を使って、カメラ内部パラメータを推定。
     """
-    print("[INFO] Running cv2.calibrateCamera ...")
+    obj_pts = [np.asarray(o, dtype=np.float32) for o in obj_points_all]
+    img_pts = [np.asarray(i, dtype=np.float32) for i in img_points_all]
+
+    K = np.zeros((3, 3), dtype=np.float64)
+    dist = np.zeros((5, 1), dtype=np.float64)
+
     rms, K, dist, rvecs, tvecs = cv2.calibrateCamera(
-        objectPoints=obj_points_all,
-        imagePoints=img_points_all,
-        imageSize=image_size,
-        cameraMatrix=None,
-        distCoeffs=None,
+        obj_pts, img_pts, image_size, K, dist,
+        flags=cv2.CALIB_RATIONAL_MODEL
     )
+
     print(f"[INFO] Calibration RMS reprojection error: {rms:.4f} px")
     print("[INFO] Camera matrix K:")
     print(K)
     print("[INFO] Distortion coefficients:")
     print(dist.ravel())
+
     return rms, K, dist, rvecs, tvecs
 
 
-def run_handeye(
-    R_gripper2base,
-    t_gripper2base,
-    rvecs_board2cam,
-    tvecs_board2cam,
-    method=cv2.CALIB_HAND_EYE_TSAI,
-):
+def run_handeye(R_gripper2base, t_gripper2base, rvecs, tvecs, method=cv2.CALIB_HAND_EYE_TSAI):
     """
-    OpenCV の calibrateHandEye を用いて Hand-Eye を解く。
+    OpenCV の Hand-Eye を呼び出す。
 
-    入力:
-        - R_gripper2base, t_gripper2base:
-            base 座標系に対する gripper の姿勢 ( ^bT_g )
-        - rvecs_board2cam, tvecs_board2cam:
-            board 座標系から camera 座標系への変換 ( ^cT_t )
-            calibrateCamera の rvecs, tvecs をそのまま利用
+    - R_gripper2base[i] : ^bR_g(i)
+    - t_gripper2base[i] : ^bt_g(i)
+    - rvecs[i], tvecs[i]: ^cR_B(i), ^ct_B(i) （PnP: board->camera）
 
-    出力:
-        - R_cam2gripper, t_cam2gripper:
-            camera -> gripper ( ^gT_c )
+    戻り:
+    - R_cam2gripper : ^gR_c
+    - t_cam2gripper : ^gt_c
     """
     R_target2cam = []
     t_target2cam = []
-    for rvec, tvec in zip(rvecs_board2cam, tvecs_board2cam):
-        R_tc, _ = cv2.Rodrigues(rvec)  # target(board) -> cam
-        R_target2cam.append(R_tc)
-        t_target2cam.append(tvec.reshape(3, 1))
+    for rvec, tvec in zip(rvecs, tvecs):
+        R_cb, _ = cv2.Rodrigues(rvec)   # ^cR_B
+        t_cb = tvec.reshape(3, 1)       # ^ct_B
+        R_target2cam.append(R_cb)
+        t_target2cam.append(t_cb)
+
+    R_cam2gripper, t_cam2gripper = cv2.calibrateHandEye(
+        R_gripper2base, t_gripper2base,
+        R_target2cam, t_target2cam,
+        method=method
+    )
+    t_cam2gripper = t_cam2gripper.reshape(3, 1)
 
     print("[INFO] Running cv2.calibrateHandEye ...")
-    R_cam2gripper, t_cam2gripper = cv2.calibrateHandEye(
-        R_gripper2base,
-        t_gripper2base,
-        R_target2cam,
-        t_target2cam,
-        method=method,
-    )
-
     print("[INFO] Hand-Eye result (camera -> gripper):")
     print("R_cam2gripper =")
     print(R_cam2gripper)
     print("t_cam2gripper (m) =")
     print(t_cam2gripper.ravel())
+
     return R_cam2gripper, t_cam2gripper
 
-
-def triangulate_n_views(normalized_points, camera_poses):
+def triangulate_n_views(norm_points, cam_poses):
     """
-    多視点 (>=2) からの観測から、1つの3D点 X を線形三角測量で推定する。
+    多視点 (>=2) からの観測から、1つの3D点 X_b (base frame) を線形三角測量。
 
     Args:
-        normalized_points: list of (u, v) in normalized image coordinates
-                           (すでに undistort され、K^-1 で正規化された座標)
-        camera_poses:      list of (R, t) for each view, base->camera
-                           R: (3x3), t: (3x1), 同じ長さで normalized_points と1対1対応
+        norm_points: list of (u_n, v_n) 正規化画像座標 (undistortPoints の結果)
+        cam_poses:   list of (R_c_b, t_c_b) world(=base)->camera
 
     Returns:
-        X: (3,) np.ndarray in base coordinate
+        X_b: (3,) np.ndarray, base frame 座標
     """
-
-    assert len(normalized_points) == len(camera_poses)
-    n = len(normalized_points)
+    assert len(norm_points) == len(cam_poses)
+    n = len(norm_points)
     if n < 2:
         raise ValueError("Need at least two views for triangulation")
 
-    # A X = 0 を解く (X は同次座標 (X,Y,Z,1))
     A = []
-
-    for (u, v), (R, t) in zip(normalized_points, camera_poses):
-        # P = [R | t], 正規化済みなので K は不要
-        P = np.hstack([R, t])
-        # 行ごとに
-        p0 = P[0, :]
-        p1 = P[1, :]
-        p2 = P[2, :]
+    for (u, v), (R_c_b, t_c_b) in zip(norm_points, cam_poses):
+        # P = [R | t] with world->cam, normalized coords
+        P = np.hstack([R_c_b, t_c_b])  # 3x4
+        p0, p1, p2 = P[0, :], P[1, :], P[2, :]
 
         A.append(u * p2 - p0)
         A.append(v * p2 - p1)
 
     A = np.stack(A, axis=0)  # (2n, 4)
-
-    # SVD で最小固有ベクトルを取る
     _, _, Vt = np.linalg.svd(A)
-    X_h = Vt[-1, :]  # (4,)
+    X_h = Vt[-1, :]
     X_h /= X_h[3]
-
     return X_h[:3]
 
 def reconstruct_charuco_points_in_base(
@@ -492,31 +491,47 @@ def reconstruct_charuco_points_in_base(
     dist,
     R_cam2gripper,
     t_cam2gripper,
+    euler_order="XYZ",
     min_corners=15,
     min_views_per_id=3,
-    max_reproj_error_px=1.5,
-    show_reprojection=False,
+    max_reproj_error_px=None,   # None ならフィルタしない
+    show_reprojection=True,
 ):
     """
-    推定されたカメラポーズを固定利用して、Charuco コーナを
-    ロボットベース座標系で再構成する。
+    Hand-Eye で求めたカメラポーズ (^bT_c) を固定利用し、
+    Charuco コーナを base 座標系で多視点再構成する。
 
-    Returns:
-        id_to_Xb: dict {charuco_id: 3D point (3,) in base frame}
-        reproj_errors: list of reprojection errors [px]
-        T_base_cam_list: list of 4x4 base->camera for each used image
+    - JSON: base->gripper (^bT_g)
+    - Hand-Eye: gripper->camera (^gT_c)
+    - => base->camera (^bT_c) = ^bT_g · ^gT_c
+    - 投影・三角測量は world->camera (^cT_b) を使う
     """
-    board, dictionary = create_charuco_board()
-    robot_poses = load_robot_captures(json_path)
 
-    # camera->gripper ( ^gT_c ) を 4x4 に
-    T_g_c = np.eye(4)
+    # --- Charuco ボード定義（あなたの条件にあわせる） ---
+    squares_x = 7
+    squares_y = 5
+    marker_length_m = 0.024  # 24mm
+    square_length_m = 0.032  # 32mm
+
+    dictionary = aruco.getPredefinedDictionary(aruco.DICT_4X4_50)
+    board = aruco.CharucoBoard(
+        (squares_x, squares_y),
+        square_length_m,
+        marker_length_m,
+        dictionary
+    )
+
+    # --- ロボット JSON ロード ---
+    with open(json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    robot_poses = {cap["image_file"]: cap["pose"] for cap in data["captures"]}
+
+    # --- Hand-Eye: ^gT_c ---
+    T_g_c = np.eye(4, dtype=np.float64)
     T_g_c[:3, :3] = R_cam2gripper
     T_g_c[:3, 3] = t_cam2gripper[:, 0]
 
-    # gripper->camera ( ^cT_g )
-    T_c_g = np.linalg.inv(T_g_c)
-
+    # --- 画像列挙 ---
     image_paths = sorted(
         glob.glob(os.path.join(image_dir, "*.png"))
         + glob.glob(os.path.join(image_dir, "*.jpg"))
@@ -525,9 +540,11 @@ def reconstruct_charuco_points_in_base(
     if not image_paths:
         raise RuntimeError(f"No images found in {image_dir} for reconstruction")
 
-    # Charuco ID ごとに、(u,v) とカメラ姿勢を集める
-    id_to_measurements = {}  # id -> list of (u, v, R_bc, t_bc)
-    T_base_cam_list = []     # 可視化用
+    # 各 Charuco ID ごとに観測集約
+    # id -> list of dict{u_px,v_px,u_n,v_n,R_c_b,t_c_b}
+    id_to_meas = {}
+
+    T_b_c_list = []     # base->camera
     used_image_paths = []
 
     for img_path in image_paths:
@@ -556,125 +573,209 @@ def reconstruct_charuco_points_in_base(
             continue
 
         # base->gripper
-        T_b_g = pose_to_T_base_gripper(robot_poses[img_name])
-        # base->camera = base->gripper * gripper->camera
+        T_b_g = pose_to_T_base_gripper(robot_poses[img_name], euler_order=euler_order)
+        # base->camera
         T_b_c = T_b_g @ T_g_c
-        
-        T_c_b = np.linalg.inv(T_b_c)
-        R_cb, t_cb = T_to_R_t(T_c_b)
-        
-        R_bc, t_bc = T_to_R_t(T_b_c)
-
-        # 画像座標 -> 正規化座標 (undistort)
-        # charuco_corners: (N,1,2)
-        pts = charuco_corners.reshape(-1, 1, 2)
-        undistorted = cv2.undistortPoints(pts, K, dist)  # (N,1,2), normalized
-
-        for idx, cid in enumerate(charuco_ids.flatten()):
-            u, v = undistorted[idx, 0, :]  # 正規化座標
-            if cid not in id_to_measurements:
-                id_to_measurements[cid] = []
-            id_to_measurements[cid].append((u, v, R_cb, t_cb))
-
-        T_base_cam_list.append(T_b_c)
+        T_b_c_list.append(T_b_c)
         used_image_paths.append(img_path)
 
-    # id ごとに多視点三角測量
-    id_to_Xb = {}
-    all_reproj_errors = []
+        # world->camera (base->cam の逆)
+        R_c_b, t_c_b = base_to_cam_to_world_to_cam(T_b_c)
 
-    for cid, meas_list in id_to_measurements.items():
+        # Charuco 2D 座標（画素 & 正規化）
+        pts_px = charuco_corners.reshape(-1, 1, 2).astype(np.float32)  # (N,1,2)
+        pts_norm = cv2.undistortPoints(pts_px, K, dist)                # (N,1,2)
+
+        for idx, cid in enumerate(charuco_ids.flatten()):
+            u_px, v_px = pts_px[idx, 0, :]
+            u_n, v_n = pts_norm[idx, 0, :]
+
+            cid_int = int(cid)
+            if cid_int not in id_to_meas:
+                id_to_meas[cid_int] = []
+            id_to_meas[cid_int].append(
+                {
+                    "u_px": float(u_px),
+                    "v_px": float(v_px),
+                    "u_n": float(u_n),
+                    "v_n": float(v_n),
+                    "R_c_b": R_c_b,
+                    "t_c_b": t_c_b,
+                }
+            )
+
+    # --- ID ごとに多視点三角測量 ---
+    id_to_Xb = {}
+    all_err_px = []
+
+    for cid, meas_list in id_to_meas.items():
         if len(meas_list) < min_views_per_id:
             continue
 
-        normalized_points = []
-        camera_poses = []
-        for (u, v, R_bc, t_bc) in meas_list:
-            normalized_points.append((u, v))
-            camera_poses.append((R_bc, t_bc))
+        norm_points = []
+        cam_poses = []
+        for m in meas_list:
+            norm_points.append((m["u_n"], m["v_n"]))
+            cam_poses.append((m["R_c_b"], m["t_c_b"]))
 
         try:
-            Xb = triangulate_n_views(normalized_points, camera_poses)
+            X_b = triangulate_n_views(norm_points, cam_poses)
         except np.linalg.LinAlgError:
             continue
 
-        # 再投影誤差評価
-        reproj_errors = []
-        for (u, v, R_bc, t_bc) in meas_list:
-            # 正規化座標系で投影
-            X_cam = R_cb @ Xb.reshape(3, 1) + t_cb  # 3x1
-            x_proj = X_cam[0, 0] / X_cam[2, 0]
-            y_proj = X_cam[1, 0] / X_cam[2, 0]
-            err = np.sqrt((x_proj - u) ** 2 + (y_proj - v) ** 2)
-            reproj_errors.append(err)
+        # 再投影誤差（px）を計算
+        per_view_err = []
+        for m in meas_list:
+            R_c_b = m["R_c_b"]
+            t_c_b = m["t_c_b"]
+            u_px_obs = m["u_px"]
+            v_px_obs = m["v_px"]
 
-        rms_err = float(np.sqrt(np.mean(np.square(reproj_errors))))
-        # 正規化座標での誤差 [rad] 程度なので、px に近似換算する場合は fx を掛けるなどもありだが、
-        # ここでは閾値を「正規化空間の誤差」で扱う:
-        # だいたい u,v ~ x/z なので、1px ~ 1/fx と見なすと、この閾値は ~1/fx オーダ。
-        # fx ~ 900 のとき、1px ≈ 1/900 ≈ 0.0011 なので、ざっくり 0.002〜0.003 程度を「1〜3px 程度」と見なせる。
-        # if rms_err > max_reproj_error_px / K[0, 0]:
-        #     # 外れ値ぽいのでスキップ
-        #     continue
+            # projectPoints 用の rvec,tvec
+            rvec, _ = cv2.Rodrigues(R_c_b)
+            X_obj = X_b.reshape(1, 3).astype(np.float32)
+            uv_proj, _ = cv2.projectPoints(
+                X_obj,
+                rvec.astype(np.float32),
+                t_c_b.astype(np.float32),
+                K,
+                dist,
+            )
+            u_px_pred, v_px_pred = uv_proj[0, 0, :]
 
-        id_to_Xb[cid] = Xb
-        all_reproj_errors.extend(reproj_errors)
+            err = np.hypot(u_px_pred - u_px_obs, v_px_pred - v_px_obs)
+            per_view_err.append(err)
+
+        rms_px = float(np.sqrt(np.mean(np.square(per_view_err))))
+
+        if (max_reproj_error_px is not None) and (rms_px > max_reproj_error_px):
+            # 外れ ID とみなしてスキップ
+            continue
+
+        id_to_Xb[cid] = X_b
+        all_err_px.extend(per_view_err)
 
     if not id_to_Xb:
         print("[WARN] No Charuco 3D points reconstructed after filtering")
     else:
-        # 正規化空間の誤差をピクセル換算して統計表示
-        errs_px = np.array(all_reproj_errors) * K[0, 0]
+        errs = np.array(all_err_px)
         print(f"[INFO] Reconstructed {len(id_to_Xb)} Charuco IDs in base frame")
-        print(f"[INFO] Reprojection error (px): mean={errs_px.mean():.3f}, "
-              f"median={np.median(errs_px):.3f}, max={errs_px.max():.3f}")
+        print(
+            "[INFO] Reprojection error (px): "
+            f"mean={errs.mean():.3f}, median={np.median(errs):.3f}, max={errs.max():.3f}"
+        )
 
-    # 任意で、1枚目に再投影結果を描画して確認
+    # --- 任意の1枚で再投影を可視化 ---
     if show_reprojection and used_image_paths and id_to_Xb:
         img_path = used_image_paths[0]
         img_name = os.path.basename(img_path)
         img = cv2.imread(img_path)
         if img is not None and img_name in robot_poses:
-            T_b_g = pose_to_T_base_gripper(robot_poses[img_name])
+            # base->camera
+            T_b_g = pose_to_T_base_gripper(robot_poses[img_name], euler_order=euler_order)
             T_b_c = T_b_g @ T_g_c
-            
-            T_c_b = np.linalg.inv(T_b_c)
-            R_cb, t_cb = T_to_R_t(T_c_b)
-            
-            R_bc, t_bc = T_to_R_t(T_b_c)
-            
-            rvec_cb, _ = cv2.Rodrigues(R_cb)
+            R_c_b, t_c_b = base_to_cam_to_world_to_cam(T_b_c)
 
-            # base->camera 外部と K, dist から reproject
-            for cid, Xb in id_to_Xb.items():
-                X_cam = R_bc @ Xb.reshape(3, 1) + t_bc
-                x, y, z = X_cam[:, 0]
-                if z <= 0:
-                    continue
-                xn = x / z
-                yn = y / z
-                uv = np.array([[[xn, yn]]], dtype=np.float32)
-                # ここで再度 distort をかけて画像座標へ
-                uv_dist = cv2.projectPoints(
-                    Xb.reshape(1, 3).astype(np.float32),
-                    rvec_cb,
-                    t_cb.astype(np.float32),
+            for cid, X_b in id_to_Xb.items():
+                rvec, _ = cv2.Rodrigues(R_c_b)
+                X_obj = X_b.reshape(1, 3).astype(np.float32)
+                uv_proj, _ = cv2.projectPoints(
+                    X_obj,
+                    rvec.astype(np.float32),
+                    t_c_b.astype(np.float32),
                     K,
-                    dist
-                )[0]
-                u_px, v_px = uv_dist[0, 0, :]
-
-                cv2.circle(img, (int(u_px), int(v_px)), 4, (0, 0, 255), -1)
+                    dist,
+                )
+                u_px_pred, v_px_pred = uv_proj[0, 0, :]
+                cv2.circle(
+                    img,
+                    (int(round(u_px_pred)), int(round(v_px_pred))),
+                    4,
+                    (0, 0, 255),
+                    -1,
+                )
 
             cv2.imshow("charuco_reprojection", img)
             print("[INFO] Showing reprojected Charuco points. Press any key to close.")
             cv2.waitKey(0)
-            try:
-                cv2.destroyWindow("charuco_reprojection")
-            except cv2.error:
-                cv2.destroyAllWindows()
+            cv2.destroyAllWindows()
 
-    return id_to_Xb, all_reproj_errors, T_base_cam_list
+    return id_to_Xb, T_b_c_list, used_image_paths
+
+def rotation_matrix_to_quaternion(R):
+    """
+    3x3 回転行列 -> (qw,qx,qy,qz)  [Hamilton convention, COLMAP互換]
+    """
+    # 数値安定性を考慮した標準実装
+    m00, m01, m02 = R[0, :]
+    m10, m11, m12 = R[1, :]
+    m20, m21, m22 = R[2, :]
+
+    tr = m00 + m11 + m22
+
+    if tr > 0:
+        S = np.sqrt(tr + 1.0) * 2.0
+        qw = 0.25 * S
+        qx = (m21 - m12) / S
+        qy = (m02 - m20) / S
+        qz = (m10 - m01) / S
+    elif (m00 > m11) and (m00 > m22):
+        S = np.sqrt(1.0 + m00 - m11 - m22) * 2.0
+        qw = (m21 - m12) / S
+        qx = 0.25 * S
+        qy = (m01 + m10) / S
+        qz = (m02 + m20) / S
+    elif m11 > m22:
+        S = np.sqrt(1.0 + m11 - m00 - m22) * 2.0
+        qw = (m02 - m20) / S
+        qx = (m01 + m10) / S
+        qy = 0.25 * S
+        qz = (m12 + m21) / S
+    else:
+        S = np.sqrt(1.0 + m22 - m00 - m11) * 2.0
+        qw = (m10 - m01) / S
+        qx = (m02 + m20) / S
+        qy = (m12 + m21) / S
+        qz = 0.25 * S
+
+    return np.array([qw, qx, qy, qz], dtype=np.float64)
+
+
+def export_colmap_images(
+    T_b_c_list,
+    image_paths,
+    out_path,
+    camera_id=1,
+):
+    """
+    Hand-Eye + ロボットから得た base->camera (^bT_c) の列を
+    COLMAP の images.txt 形式で書き出す。
+
+    world は base 座標系とみなす。
+
+    各行:
+        IMAGE_ID QW QX QY QZ TX TY TZ CAMERA_ID IMAGE_NAME
+        <空行>
+    """
+    assert len(T_b_c_list) == len(image_paths)
+
+    with open(out_path, "w", encoding="utf-8") as f:
+        for i, (T_b_c, img_path) in enumerate(zip(T_b_c_list, image_paths), start=1):
+            R_c_b, t_c_b = base_to_cam_to_world_to_cam(T_b_c)  # world->cam
+
+            q = rotation_matrix_to_quaternion(R_c_b)
+            qw, qx, qy, qz = q
+            tx, ty, tz = t_c_b.flatten().tolist()
+
+            img_name = os.path.basename(img_path)
+
+            f.write(
+                f"{i} {qw:.16f} {qx:.16f} {qy:.16f} {qz:.16f} "
+                f"{tx:.16f} {ty:.16f} {tz:.16f} {camera_id} {img_name}\n"
+            )
+            f.write("\n")
+
+    print(f"[INFO] Wrote COLMAP images.txt to: {out_path}")
 
 
 # ---------------------------------------------------------------
@@ -829,7 +930,9 @@ def parse_args():
 
 def main():
     args = parse_args()
+    # args.image_dir, args.json, args.colmap_images_out など
 
+    # 1) Charuco + ロボットで対応抽出
     (
         obj_points_all,
         img_points_all,
@@ -844,35 +947,14 @@ def main():
         show_detections=not args.no_show,
     )
 
-    # 1) intrinsics
+    # 2) intrinsics
     rms, K, dist, rvecs, tvecs = calibrate_intrinsics(
         obj_points_all,
         img_points_all,
         image_size,
     )
 
-    # --- 新規: Euler 順序の候補評価 ---
-    candidate_orders = ["XYZ", "XZY", "YXZ", "YZX", "ZXY", "ZYX"]
-    results = {}
-    for order in candidate_orders:
-        print(f"[INFO] Evaluating Euler order: {order}")
-        res = evaluate_euler_order(
-            euler_order=order,
-            robot_json_path=args.json,
-            used_image_paths=used_image_paths,
-            K=K,
-            dist=dist,
-            rvecs=rvecs,
-            tvecs=tvecs,
-        )
-        results[order] = res
-
-    # cost が最小の順序を採用
-    best_order = min(results.keys(), key=lambda o: results[o]["cost"])
-    print(f"[INFO] Best Euler order estimated from data: {best_order}")
-
-
-    # 2) Hand-Eye
+    # 3) Hand-Eye (XYZ オーダで十分良いことは既に確認済み)
     R_cam2gripper, t_cam2gripper = run_handeye(
         R_gripper2base,
         t_gripper2base,
@@ -881,93 +963,31 @@ def main():
         method=cv2.CALIB_HAND_EYE_TSAI,
     )
 
-    # 3) 3D 可視化（gripper & camera 軌跡）
-    robot_poses = load_robot_captures(args.json)
-    T_base_gripper_list = []
-    for img_path in used_image_paths:
-        img_name = os.path.basename(img_path)
-        T_b_g = pose_to_T_base_gripper(robot_poses[img_name])
-        T_base_gripper_list.append(T_b_g)
-
-    visualize_poses_3d(
-        T_base_gripper_list,
-        R_cam2gripper,
-        t_cam2gripper,
-        title="Robot base, gripper, and camera trajectories",
-    )
-
-    # 4) Undistort サンプル表示（任意）
-    if not args.no_show and len(used_image_paths) > 0:
-        undistort_and_show_sample(used_image_paths[0], K, dist)
-
-    # 5) 推定カメラポーズを固定利用した Charuco 3D 再構成
-    print("[INFO] Reconstructing Charuco points in base frame using fixed camera poses ...")
-    id_to_Xb, reproj_errors_norm, T_base_cam_list = reconstruct_charuco_points_in_base(
+    # 4) カメラポーズ固定利用の Charuco 再構成
+    id_to_Xb, T_b_c_list, used_image_paths = reconstruct_charuco_points_in_base(
         image_dir=args.image_dir,
         json_path=args.json,
         K=K,
         dist=dist,
         R_cam2gripper=R_cam2gripper,
         t_cam2gripper=t_cam2gripper,
+        euler_order="XYZ",
         min_corners=15,
         min_views_per_id=3,
-        max_reproj_error_px=1.5,
+        max_reproj_error_px=None,  # 例: 3.0
         show_reprojection=not args.no_show,
     )
 
-    if id_to_Xb:
-        # 3D 可視化: base座標系における camera 軌跡 + Charuco 3D 点
-        fig = plt.figure()
-        ax = fig.add_subplot(111, projection="3d")
-        ax.set_title("Charuco 3D points in robot base frame")
-
-        # base frame
-        plot_frames_3d(ax, np.eye(4), length=0.05, label="base")
-
-        # camera centers
-        cam_centers = []
-        for T_b_c in T_base_cam_list:
-            cam_centers.append(T_b_c[:3, 3])
-            plot_frames_3d(ax, T_b_c, length=0.03, alpha=0.4)
-
-        cam_centers = np.array(cam_centers)
-        ax.scatter(
-            cam_centers[:, 0],
-            cam_centers[:, 1],
-            cam_centers[:, 2],
-            marker="^",
-            label="camera centers",
+    # 5) COLMAP images.txt 出力
+    colmap_images_out = 'output/images.txt'
+    if colmap_images_out is not None:
+        export_colmap_images(
+            T_b_c_list=T_b_c_list,
+            image_paths=used_image_paths,
+            out_path=colmap_images_out,
+            camera_id=1,
         )
 
-        # Charuco 3D points
-        Xbs = np.stack(list(id_to_Xb.values()), axis=0)
-        ax.scatter(
-            Xbs[:, 0],
-            Xbs[:, 1],
-            Xbs[:, 2],
-            marker="o",
-            label="Charuco 3D",
-        )
-
-        ax.set_xlabel("X [m]")
-        ax.set_ylabel("Y [m]")
-        ax.set_zlabel("Z [m]")
-        ax.legend()
-        ax.set_box_aspect([1, 1, 1])
-
-        # 軸範囲の調整
-        all_pts = np.vstack([cam_centers, Xbs])
-        mins = all_pts.min(axis=0)
-        maxs = all_pts.max(axis=0)
-        span = max(maxs - mins)
-        center = (mins + maxs) / 2.0
-        ax.set_xlim(center[0] - span * 0.6, center[0] + span * 0.6)
-        ax.set_ylim(center[1] - span * 0.6, center[1] + span * 0.6)
-        ax.set_zlim(center[2] - span * 0.6, center[2] + span * 0.6)
-
-        plt.show()
-    else:
-        print("[WARN] No 3D Charuco points reconstructed; skipping 3D plot.")
 
 
 if __name__ == "__main__":
