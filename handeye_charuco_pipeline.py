@@ -665,19 +665,47 @@ def reconstruct_charuco_points_in_base(
             f"mean={errs.mean():.3f}, median={np.median(errs):.3f}, max={errs.max():.3f}"
         )
 
-    # --- 任意の1枚で再投影を可視化 ---
+    # --- 任意の1枚で再投影を可視化（観測点と対応を描画） ---
     if show_reprojection and used_image_paths and id_to_Xb:
+        # 1番目に使われた画像を可視化対象とする
         img_path = used_image_paths[0]
         img_name = os.path.basename(img_path)
         img = cv2.imread(img_path)
-        if img is not None and img_name in robot_poses:
-            # base->camera
-            T_b_g = pose_to_T_base_gripper(robot_poses[img_name], euler_order=euler_order)
-            T_b_c = T_b_g @ T_g_c
-            R_c_b, t_c_b = base_to_cam_to_world_to_cam(T_b_c)
 
+        if img is not None and img_name in robot_poses:
+            # base->gripper, base->camera, world->camera を再計算
+            T_b_g = pose_to_T_base_gripper(
+                robot_poses[img_name],
+                euler_order=euler_order,
+            )
+            T_b_c = T_b_g @ T_g_c              # ^bT_c (cam -> base)
+            R_c_b, t_c_b = base_to_cam_to_world_to_cam(T_b_c)  # ^cR_b, ^ct_b
+
+            # この画像で観測された Charuco corner を (id -> (u_px,v_px)) にまとめる
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            corners, ids, _ = aruco.detectMarkers(gray, dictionary)
+            if ids is not None and len(ids) > 0:
+                _, charuco_corners, charuco_ids = aruco.interpolateCornersCharuco(
+                    markerCorners=corners,
+                    markerIds=ids,
+                    image=gray,
+                    board=board,
+                )
+            else:
+                charuco_corners, charuco_ids = None, None
+
+            obs2d = {}
+            if charuco_ids is not None:
+                pts_px = charuco_corners.reshape(-1, 2)
+                for idx, cid in enumerate(charuco_ids.flatten()):
+                    obs2d[int(cid)] = (
+                        float(pts_px[idx, 0]),
+                        float(pts_px[idx, 1]),
+                    )
+
+            # 観測点（緑）と再投影点（赤）を描く
+            rvec, _ = cv2.Rodrigues(R_c_b)
             for cid, X_b in id_to_Xb.items():
-                rvec, _ = cv2.Rodrigues(R_c_b)
                 X_obj = X_b.reshape(1, 3).astype(np.float32)
                 uv_proj, _ = cv2.projectPoints(
                     X_obj,
@@ -687,6 +715,8 @@ def reconstruct_charuco_points_in_base(
                     dist,
                 )
                 u_px_pred, v_px_pred = uv_proj[0, 0, :]
+
+                # 再投影点（赤）
                 cv2.circle(
                     img,
                     (int(round(u_px_pred)), int(round(v_px_pred))),
@@ -695,10 +725,31 @@ def reconstruct_charuco_points_in_base(
                     -1,
                 )
 
+                # 観測点がこの画像にも存在するなら（緑）
+                if cid in obs2d:
+                    u_px_obs, v_px_obs = obs2d[cid]
+                    cv2.circle(
+                        img,
+                        (int(round(u_px_obs)), int(round(v_px_obs))),
+                        4,
+                        (0, 255, 0),
+                        -1,
+                    )
+                    # 緑→赤の線を引いてズレを視覚化
+                    cv2.line(
+                        img,
+                        (int(round(u_px_obs)), int(round(v_px_obs))),
+                        (int(round(u_px_pred)), int(round(v_px_pred))),
+                        (0, 255, 255),
+                        1,
+                    )
+
             cv2.imshow("charuco_reprojection", img)
-            print("[INFO] Showing reprojected Charuco points. Press any key to close.")
+            print("[INFO] Showing observed (green) vs reprojected (red) Charuco points. "
+                  "Press any key to close.")
             cv2.waitKey(0)
             cv2.destroyAllWindows()
+
 
     return id_to_Xb, T_b_c_list, used_image_paths
 
@@ -988,7 +1039,80 @@ def main():
             camera_id=1,
         )
 
+# -----可視化ブロック------
 
+    # 1) Undistort サンプル表示（任意）
+    if not args.no_show and len(used_image_paths) > 0:
+        undistort_and_show_sample(used_image_paths[0], K, dist)
+
+    # 2) 3D 可視化（gripper & camera 軌跡）
+    robot_poses = load_robot_captures(args.json)
+    T_base_gripper_list = []
+    for img_path in used_image_paths:
+        img_name = os.path.basename(img_path)
+        T_b_g = pose_to_T_base_gripper(robot_poses[img_name])
+        T_base_gripper_list.append(T_b_g)
+
+    visualize_poses_3d(
+        T_base_gripper_list,
+        R_cam2gripper,
+        t_cam2gripper,
+        title="Robot base, gripper, and camera trajectories",
+    )
+
+    # 3) 3D 可視化: base座標系における camera 軌跡 + Charuco 3D 点
+    if id_to_Xb:
+        fig = plt.figure()
+        ax = fig.add_subplot(111, projection="3d")
+        ax.set_title("Charuco 3D points in robot base frame")
+
+        # base frame
+        plot_frames_3d(ax, np.eye(4), length=0.05, label="base")
+
+        # camera centers
+        cam_centers = []
+        for T_b_c in T_b_c_list:
+            cam_centers.append(T_b_c[:3, 3])
+            plot_frames_3d(ax, T_b_c, length=0.03, alpha=0.4)
+
+        cam_centers = np.array(cam_centers)
+        ax.scatter(
+            cam_centers[:, 0],
+            cam_centers[:, 1],
+            cam_centers[:, 2],
+            marker="^",
+            label="camera centers",
+        )
+
+        # Charuco 3D points
+        Xbs = np.stack(list(id_to_Xb.values()), axis=0)
+        ax.scatter(
+            Xbs[:, 0],
+            Xbs[:, 1],
+            Xbs[:, 2],
+            marker="o",
+            label="Charuco 3D",
+        )
+
+        ax.set_xlabel("X [m]")
+        ax.set_ylabel("Y [m]")
+        ax.set_zlabel("Z [m]")
+        ax.legend()
+        ax.set_box_aspect([1, 1, 1])
+
+        # 軸範囲の調整
+        all_pts = np.vstack([cam_centers, Xbs])
+        mins = all_pts.min(axis=0)
+        maxs = all_pts.max(axis=0)
+        span = max(maxs - mins)
+        center = (mins + maxs) / 2.0
+        ax.set_xlim(center[0] - span * 0.6, center[0] + span * 0.6)
+        ax.set_ylim(center[1] - span * 0.6, center[1] + span * 0.6)
+        ax.set_zlim(center[2] - span * 0.6, center[2] + span * 0.6)
+        plt.show()
+        
+    else:
+        print("[warn] No 3D charuco points reconstructed; skipping 3D plot")
 
 if __name__ == "__main__":
     main()

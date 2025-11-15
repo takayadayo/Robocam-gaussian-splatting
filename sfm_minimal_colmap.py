@@ -817,7 +817,7 @@ def reconstruct_with_fixed_poses(files, K, cameras, keypoints, descriptors):
             # 最終的な3D点を、インライア観測のみを使って再計算
             final_point = triangulate_n_views(K, cams_refine, uvs_refine, 
                                               min_parallax_deg=0, # 視差は初期化で保証済み
-                                              max_reproj_error_px=2.5) # 再チェック
+                                              max_reproj_error_px=25) # 再チェック
             
             if final_point is not None:
                 points3d.append(final_point)
