@@ -290,7 +290,7 @@ def project_point(K, R, t, X):
     return u[:2].reshape(2)
 
 def refine_points(K, cameras, points3d, observations, iterations=2):
-    
+    """ observations: list of (img_id, kp_idx, uv) """
     for iter_count in range(iterations):
         num_refined = 0
         for pid, point in enumerate(points3d):
@@ -299,7 +299,8 @@ def refine_points(K, cameras, points3d, observations, iterations=2):
             
             registered_views = []
             valid_obs = []
-            for img_id, uv in observations[pid]:
+            # fix: unpack 3 elements
+            for img_id, kp_idx, uv in observations[pid]:
                 if cameras[img_id] is not None:
                     registered_views.append(cameras[img_id])
                     valid_obs.append(uv)
@@ -315,7 +316,9 @@ def refine_points(K, cameras, points3d, observations, iterations=2):
             break
     return points3d
 
+
 def prune_outliers(K, cameras, points3d, observations, base_thresh=3.0, max_iter=3):
+    """ observations: list of (img_id, kp_idx, uv) """
     removed_obs_total = 0
     removed_pts_total = 0
     for _ in range(max_iter):
@@ -326,7 +329,8 @@ def prune_outliers(K, cameras, points3d, observations, base_thresh=3.0, max_iter
                 continue
             obs = observations[pid]
             residuals = []
-            for img_id, uv in obs:
+            # fix: unpack 3 elements
+            for img_id, kp_idx, uv in obs:
                 cam = cameras[img_id]
                 if cam is None:
                     continue
@@ -335,26 +339,31 @@ def prune_outliers(K, cameras, points3d, observations, base_thresh=3.0, max_iter
                 if proj is None:
                     continue
                 error = float(np.linalg.norm(proj - uv))
-                residuals.append((img_id, uv, error))
+                # fix: store kp_idx as well
+                residuals.append((img_id, kp_idx, uv, error))
+            
             if len(residuals) < 2:
                 points3d[pid] = None
                 observations[pid] = []
                 removed_pts += 1
                 continue
-            errs = np.array([r[2] for r in residuals], dtype=np.float64)
+            
+            errs = np.array([r[3] for r in residuals], dtype=np.float64)
             median = float(np.median(errs))
             mad = float(np.median(np.abs(errs - median))) + 1e-6
             thresh = max(base_thresh, median + 3.0 * 1.4826 * mad)
+            
             new_obs = []
-            for img_id, uv, err in residuals:
+            for img_id, kp_idx, uv, err in residuals:
                 if err <= thresh:
-                    new_obs.append((img_id, uv))
+                    new_obs.append((img_id, kp_idx, uv))
                 else:
                     removed_obs += 1
             observations[pid] = new_obs
             if len(new_obs) < 2:
                 points3d[pid] = None
                 removed_pts += 1
+        
         removed_obs_total += removed_obs
         removed_pts_total += removed_pts
         if removed_obs == 0 and removed_pts == 0:
@@ -363,12 +372,14 @@ def prune_outliers(K, cameras, points3d, observations, base_thresh=3.0, max_iter
 
 
 def reprojection_stats(K, cameras, points3d, observations):
+    """ observations: list of (img_id, kp_idx, uv) """
     residuals = []
     per_view = defaultdict(list)
     for pid, X in enumerate(points3d):
         if X is None:
             continue
-        for img_id, uv in observations[pid]:
+        # fix: unpack 3 elements
+        for img_id, kp_idx, uv in observations[pid]:
             cam = cameras[img_id]
             if cam is None:
                 continue
@@ -421,10 +432,7 @@ def select_initial_pair(kps, descs, K):
     return i0, i1, R, t, X, kept, match_dict
 
 def save_ply(filepath, points3d, imgs_raw, observations):
-    """
-    3D点群をPLYファイルとして保存する。
-    各点の色は、その点を観測した最初の画像のピクセル色から取得する。
-    """
+    """ observations: list of (img_id, kp_idx, uv) """
     if not points3d:
         print("[warn] No 3D points to save.")
         return
@@ -436,9 +444,9 @@ def save_ply(filepath, points3d, imgs_raw, observations):
         if point is None:
             continue
         
-        # この点を観測した最初の画像を探す
         first_obs = None
-        for img_id, uv in observations[pid]:
+        # fix: unpack 3 elements
+        for img_id, kp_idx, uv in observations[pid]:
             if imgs_raw[img_id] is not None:
                 first_obs = (img_id, uv)
                 break
@@ -450,7 +458,7 @@ def save_ply(filepath, points3d, imgs_raw, observations):
             
             if 0 <= v < h and 0 <= u < w:
                 bgr = imgs_raw[img_id][v, u]
-                rgb = (bgr[2], bgr[1], bgr[0]) # BGR -> RGB
+                rgb = (bgr[2], bgr[1], bgr[0])
                 valid_points.append(point)
                 colors.append(rgb)
 
@@ -477,9 +485,6 @@ end_header
     print(f"[info] Saved {len(valid_points)} points to {filepath}")
 
 def run_incremental_sfm(files, K, keypoints, descriptors, imgs):
-    """
-    画像と特徴量から、増分型SfMを実行してカメラポーズと3D点群を推定する。
-    """
     print("[info] Running in Incremental SfM mode.")
 
     cameras = [None] * len(files)
@@ -498,17 +503,13 @@ def run_incremental_sfm(files, K, keypoints, descriptors, imgs):
     cameras[i1] = (R01, t01)
     registered = {i0, i1}
 
-    # --- トラック構築と初期化 ---
-    # まず全画像間のマッチングを実行し、完全なトラックを事前に構築
     print("[info] Matching all pairs to build full tracks...")
     all_match_dict = {}
     for i in range(len(files) - 1):
         for j in range(i + 1, len(files)):
-            # 既に計算済みの初期ペアのマッチングは再利用
             if (i, j) == (i0, i1) or (j, i) == (i0, i1):
                 all_match_dict[(i0, i1)] = kept_pairs
                 continue
-            
             matches = match_features(descriptors[i], descriptors[j])
             if len(matches) > 15:
                 all_match_dict[(i,j)] = matches
@@ -517,10 +518,8 @@ def run_incremental_sfm(files, K, keypoints, descriptors, imgs):
     full_tracks = build_tracks(keypoints, all_match_dict)
     print(f"[info] Found {len(full_tracks)} tracks in total.")
     
-    # 3D化されたトラックを管理するためのセット
     triangulated_tracks = set()
     
-    # 初期ペアから最初の3D点群を生成し、観測を登録
     for track_idx, track in enumerate(full_tracks):
         kp_indices = {img_id: kp_idx for img_id, kp_idx in track}
         if i0 in kp_indices and i1 in kp_indices:
@@ -529,25 +528,24 @@ def run_incremental_sfm(files, K, keypoints, descriptors, imgs):
                 p_idx_in_X01 = kept_pairs.index(key)
                 points3d.append(X01[:, p_idx_in_X01].reshape(3))
                 
-                obs = [(img_id, np.array(keypoints[img_id][kp_idx].pt)) for img_id, kp_idx in track]
+                # fix: store (img_id, kp_idx, uv)
+                obs = [(img_id, kp_idx, np.array(keypoints[img_id][kp_idx].pt)) for img_id, kp_idx in track]
                 observations.append(obs)
                 triangulated_tracks.add(track_idx)
 
-    # --- 増分的な登録ループ ---
     while len(registered) < len(files):
-        # 次に登録する最適なビューを選択
         view_scores = defaultdict(int)
         point_indices_for_view = defaultdict(list)
         
         for pid, obs_list in enumerate(observations):
             if points3d[pid] is None: continue
-            for img_id, _ in obs_list:
+            # fix: unpack 3 elements
+            for img_id, kp_idx, uv in obs_list:
                 if img_id not in registered:
                     view_scores[img_id] += 1
                     point_indices_for_view[img_id].append(pid)
         
         if not view_scores:
-            print("[info] No more views can be registered with current 3D points.")
             break
         
         best_idx = max(view_scores, key=view_scores.get)
@@ -557,11 +555,16 @@ def run_incremental_sfm(files, K, keypoints, descriptors, imgs):
         
         print(f"[info] Registering view {best_idx} (visible 3D points: {view_scores[best_idx]})...")
 
-        # PnPのためのデータ準備
         pids_for_pnp = point_indices_for_view[best_idx]
         X3_list = [points3d[pid] for pid in pids_for_pnp]
-        x2_list = [next(uv for img_id, uv in observations[pid] if img_id == best_idx) for pid in pids_for_pnp]
-
+        # fix: find uv from obs_list which is now (img_id, kp_idx, uv)
+        x2_list = []
+        for pid in pids_for_pnp:
+            for (img_id, kp_idx, uv) in observations[pid]:
+                if img_id == best_idx:
+                    x2_list.append(uv)
+                    break
+        
         X3_arr = np.array(X3_list, dtype=np.float64).reshape(-1, 1, 3)
         x2_arr = np.array(x2_list, dtype=np.float64).reshape(-1, 1, 2)
         
@@ -573,43 +576,35 @@ def run_incremental_sfm(files, K, keypoints, descriptors, imgs):
             registered.add(best_idx)
             print(f"  -> Success. Registered views: {len(registered)}/{len(files)}")
             
-            # =============================================================
-            #  新規点の三角測量ロジック (ここからが核心部分)
-            # =============================================================
             new_points_count = 0
             for track_idx, track in enumerate(full_tracks):
                 if track_idx in triangulated_tracks:
-                    continue  # 既に3D化済み
+                    continue
 
-                # このトラックが、今回登録したビューを含んでいるか？
                 track_img_ids = {obs[0] for obs in track}
                 if best_idx not in track_img_ids:
                     continue
 
-                # 登録済みのビューからの観測を収集
                 cams_for_tri, uvs_for_tri = [], []
                 for img_id, kp_idx in track:
                     if cameras[img_id] is not None:
                         cams_for_tri.append(cameras[img_id])
                         uvs_for_tri.append(np.array(keypoints[img_id][kp_idx].pt))
 
-                # 2視点以上から観測されていれば三角測量可能
                 if len(cams_for_tri) >= 2:
-                    # 品質チェック付きの三角測量を実行
                     X_new = triangulate_n_views(K, cams_for_tri, uvs_for_tri, 
                                                 min_parallax_deg=1.5, 
                                                 max_reproj_error_px=2.0)
                     
                     if X_new is not None:
-                        # 成功した場合、新しい3D点と観測を登録
                         points3d.append(X_new)
-                        full_obs_list = [(img_id, np.array(keypoints[img_id][kp_idx].pt)) for img_id, kp_idx in track]
+                        # fix: store (img_id, kp_idx, uv)
+                        full_obs_list = [(img_id, kp_idx, np.array(keypoints[img_id][kp_idx].pt)) for img_id, kp_idx in track]
                         observations.append(full_obs_list)
                         triangulated_tracks.add(track_idx)
                         new_points_count += 1
             
             print(f"  -> Triangulated {new_points_count} new 3D points.")
-            # =============================================================
 
         else:
             print(f"  -> PnP failed for view {best_idx}. Stopping.")
@@ -617,21 +612,15 @@ def run_incremental_sfm(files, K, keypoints, descriptors, imgs):
             
     return cameras, points3d, observations
 
-# run_incremental_sfm の直後に追加
 
 def reconstruct_with_sfm_logic_and_fixed_poses(files, K, cameras, keypoints, descriptors):
-    """
-    既知のカメラポーズを使用し、SfMのトラック構築と三角測量ロジックで3D点群を再構成する。
-    """
     print("[info] Running SfM-based Reconstruction with provided poses.")
     
-    # 既知ポーズが設定されている画像のインデックスを取得
     registered_indices = {i for i, cam in enumerate(cameras) if cam is not None}
     if len(registered_indices) < 2:
         print("[ERROR] Less than 2 valid poses provided. Cannot reconstruct.")
         return None, None, None
 
-    # --- SfMモードと同様に、フルトラックを事前に構築 ---
     print("[info] Matching all pairs to build full tracks...")
     all_match_dict = {}
     valid_indices_list = sorted(list(registered_indices))
@@ -647,7 +636,6 @@ def reconstruct_with_sfm_logic_and_fixed_poses(files, K, cameras, keypoints, des
     full_tracks = build_tracks(keypoints, all_match_dict)
     print(f"[info] Found {len(full_tracks)} tracks in total.")
     
-    # --- トラックに基づいて三角測量を実施 ---
     points3d = []
     observations = []
     
@@ -656,22 +644,20 @@ def reconstruct_with_sfm_logic_and_fixed_poses(files, K, cameras, keypoints, des
     for track in full_tracks:
         cams_for_tri, uvs_for_tri = [], []
         
-        # このトラックが持つ観測のうち、有効なポーズを持つものを収集
         for img_id, kp_idx in track:
             if cameras[img_id] is not None:
                 cams_for_tri.append(cameras[img_id])
                 uvs_for_tri.append(np.array(keypoints[img_id][kp_idx].pt))
         
-        # 2視点以上から観測されていれば三角測量
         if len(cams_for_tri) >= 2:
-            # 品質チェック付きの三角測量を実行
             X_new = triangulate_n_views(K, cams_for_tri, uvs_for_tri, 
-                                        min_parallax_deg=1.0,  # SfMモードに近い緩めの閾値
+                                        min_parallax_deg=1.0, 
                                         max_reproj_error_px=2.5)
             
             if X_new is not None:
                 points3d.append(X_new)
-                full_obs_list = [(img_id, np.array(keypoints[img_id][kp_idx].pt)) for img_id, kp_idx in track]
+                # fix: store (img_id, kp_idx, uv)
+                full_obs_list = [(img_id, kp_idx, np.array(keypoints[img_id][kp_idx].pt)) for img_id, kp_idx in track]
                 observations.append(full_obs_list)
                 triangulated_count += 1
                 
@@ -683,13 +669,10 @@ def reconstruct_with_sfm_logic_and_fixed_poses(files, K, cameras, keypoints, des
 
     return cameras, points3d, observations
 
+
 def reconstruct_with_fixed_poses(files, K, cameras, keypoints, descriptors):
-    """
-    固定されたカメラポーズを用いて、ロバストな2段階三角測量により3D点群を再構成する。
-    """
     print("[info] Running Robust Reconstruction with Fixed Poses...")
 
-    # --- Step 0: 全ペアマッチングとトラック構築 ---
     print("[info] Matching features for all pairs with known poses...")
     match_dict = {}
     valid_indices = [i for i, c in enumerate(cameras) if c is not None]
@@ -704,23 +687,18 @@ def reconstruct_with_fixed_poses(files, K, cameras, keypoints, descriptors):
     full_tracks = build_tracks(keypoints, match_dict)
     print(f"[info] Found {len(full_tracks)} potential tracks.")
 
-    # --- Step 1: 頑健な初期化 (Two-View Triangulation) ---
     print("[info] Step 1: Initializing 3D points from robust two-view pairs...")
-    initial_points = {}  # track_idx -> (point3D, initial_pair_indices)
+    initial_points = {} 
     
-    # 視差角を効率的に計算するためのカメラ中心
     cam_centers = {i: -cam[0].T @ cam[1] for i, cam in enumerate(cameras) if cam is not None}
-    # === デバッグ用: 視差角の分布を記録 ===
-    all_best_angles_deg = []
+    
     for track_idx, track in enumerate(full_tracks):
         if len(track) < 2:
             continue
         
         best_pair_angle = -1.0
         best_pair_3d_point = None
-        best_pair_indices = None
-
-        # トラック内の全てのペアを試し、最も視差角の大きいペアを探す
+        
         for i in range(len(track)):
             for j in range(i + 1, len(track)):
                 img_id1, kp_idx1 = track[i]
@@ -730,12 +708,10 @@ def reconstruct_with_fixed_poses(files, K, cameras, keypoints, descriptors):
                 if cam1 is None or cam2 is None:
                     continue
 
-                # 2視点三角測量
                 cams_tri = [cam1, cam2]
                 uvs_tri = [np.array(keypoints[img_id1][kp_idx1].pt), 
                            np.array(keypoints[img_id2][kp_idx2].pt)]
                 
-                # Cheiralityチェックのみ行う簡易三角測量
                 A = [uv[0] * (K @ np.hstack(c))[2,:] - (K @ np.hstack(c))[0,:] for uv, c in zip(uvs_tri, cams_tri)]
                 A.extend([uv[1] * (K @ np.hstack(c))[2,:] - (K @ np.hstack(c))[1,:] for uv, c in zip(uvs_tri, cams_tri)])
                 A = np.array(A)
@@ -749,7 +725,6 @@ def reconstruct_with_fixed_poses(files, K, cameras, keypoints, descriptors):
                    (cam2[0] @ X + cam2[1].reshape(3))[2] <= 1e-4:
                     continue
 
-                # 視差角の計算
                 vec1 = X - cam_centers[img_id1].flatten()
                 vec2 = X - cam_centers[img_id2].flatten()
                 norm1, norm2 = np.linalg.norm(vec1), np.linalg.norm(vec2)
@@ -761,70 +736,48 @@ def reconstruct_with_fixed_poses(files, K, cameras, keypoints, descriptors):
                 if angle_rad > best_pair_angle:
                     best_pair_angle = angle_rad
                     best_pair_3d_point = X
-                    best_pair_indices = (img_id1, img_id2)
         
-        if best_pair_angle > 0:
-            all_best_angles_deg.append(np.rad2deg(best_pair_angle))
-
         if np.rad2deg(best_pair_angle) > 2.0:
-            initial_points[track_idx] = (best_pair_3d_point, best_pair_indices)
+            initial_points[track_idx] = best_pair_3d_point
 
-    # === デバッグ用: 視差角の統計情報を表示 ===
-    if all_best_angles_deg:
-        angles_arr = np.array(all_best_angles_deg)
-        print(f"\n[DEBUG] Parallax angle stats (deg) for {len(angles_arr)} tracks:")
-        print(f"  Min: {angles_arr.min():.2f}, Median: {np.median(angles_arr):.2f}, Max: {angles_arr.max():.2f}")
-        print(f"  Tracks exceeding 2.0 deg threshold: {np.sum(angles_arr > 2.0)} / {len(angles_arr)}\n")
-    else:
-        print("\n[DEBUG] No valid pairs found to calculate parallax angles.\n")
-
-    print(f"[info] Initialized {len(initial_points)} points with sufficient parallax.")
-
-    # ★★★ ここで処理を中断して確認 ★★★
     if len(initial_points) == 0:
-        print("[ERROR] No 3D points could be initialized. The parallax angle threshold (2.0 deg) might be too strict for this dataset, or feature matches are poor.")
+        print("[ERROR] No 3D points could be initialized.")
         return [], []
 
-    # --- Step 2: トラックの成長とリファインメント ---
     print("[info] Step 2: Growing and refining tracks...")
     points3d = []
     observations = []
     
-    for track_idx, (initial_point, _) in initial_points.items():
+    for track_idx, initial_point in initial_points.items():
         track = full_tracks[track_idx]
         
-        current_point = initial_point
         valid_observations_in_track = []
         
-        # トラック内の全観測を検証し、インライアを収集
         for img_id, kp_idx in track:
             cam = cameras[img_id]
             if cam is None: continue
             
             uv_obs = np.array(keypoints[img_id][kp_idx].pt)
-            proj = project_point(K, cam[0], cam[1], current_point.reshape(3, 1))
+            proj = project_point(K, cam[0], cam[1], initial_point.reshape(3, 1))
             
             if proj is not None:
                 reproj_error = np.linalg.norm(proj - uv_obs)
-                if reproj_error < 2.5: # 再投影誤差の閾値
+                if reproj_error < 2.5:
+                    # fix: store (img_id, kp_idx) tuple for logic below
                     valid_observations_in_track.append((img_id, kp_idx))
         
-        # 2つ以上の有効な観測があれば、リファインメントを行う
         if len(valid_observations_in_track) >= 2:
-            cams_refine = [cameras[img_id] for img_id, _ in valid_observations_in_track]
-            uvs_refine = [np.array(keypoints[img_id][kp_idx].pt) for img_id, kp_idx in valid_observations_in_track]
+            cams_refine = [cameras[i] for i, _ in valid_observations_in_track]
+            uvs_refine = [np.array(keypoints[i][k].pt) for i, k in valid_observations_in_track]
             
-            # 最終的な3D点を、インライア観測のみを使って再計算
             final_point = triangulate_n_views(K, cams_refine, uvs_refine, 
-                                              min_parallax_deg=0, # 視差は初期化で保証済み
-                                              max_reproj_error_px=25) # 再チェック
+                                              min_parallax_deg=0,
+                                              max_reproj_error_px=25)
             
             if final_point is not None:
                 points3d.append(final_point)
-                # 観測リストには、トラック全体の情報ではなく、インライアのみを保存することもできるが、
-                # prune_outliersなどで全情報が必要になる可能性を考慮し、ここではトラック全体を保存する。
-                # 後の処理でインライアのみを使いたい場合は、この情報からフィルタリングする。
-                full_obs_list = [(img_id, np.array(keypoints[img_id][kp_idx].pt)) for img_id, kp_idx in track]
+                # fix: store (img_id, kp_idx, uv)
+                full_obs_list = [(img_id, kp_idx, np.array(keypoints[img_id][kp_idx].pt)) for img_id, kp_idx in track]
                 observations.append(full_obs_list)
 
     print(f"[info] Successfully reconstructed {len(points3d)} points after growing.")
@@ -849,61 +802,103 @@ def save_poses_to_json(filepath, cameras, files):
         json.dump(pose_data, f, indent=4)
     print(f"[INFO] Saved {valid_poses} SfM-computed poses to {filepath}")
     
-# --- ADD: COLMAP export helpers ------------------------------------
-def _export_colmap_files(out_dir, files, K_used, cameras):
+# --- COLMAP export helpers ------------------------------------
+def _export_colmap_files(out_dir, files, K_used, cameras, keypoints, points3d, observations, imgs_raw):
     """
-    Export COLMAP text files for visualization:
-      - cameras.txt (PINHOLE, undistorted intrinsics)
-      - images.txt  (world->camera pose: QW QX QY QZ TX TY TZ)
-      - points3D.txt (empty)
+    Export COLMAP text files with correct 2D-3D associations.
+    observations: list of (img_id, kp_idx, uv)
     """
     os.makedirs(out_dir, exist_ok=True)
-    H, W = None, None
-    for f in files:
-        im = cv2.imread(f, cv2.IMREAD_COLOR)
-        if im is not None:
-            H, W = im.shape[:2]
-            break
-    if H is None:
-        raise RuntimeError("Could not read any image to infer size.")
+    if not imgs_raw:
+        return
 
+    H, W = imgs_raw[0].shape[:2]
     fx, fy, cx, cy = float(K_used[0,0]), float(K_used[1,1]), float(K_used[0,2]), float(K_used[1,2])
 
     cam_path   = os.path.join(out_dir, "cameras.txt")
     img_path   = os.path.join(out_dir, "images.txt")
     pts3d_path = os.path.join(out_dir, "points3D.txt")
 
-    # --- cameras.txt (PINHOLE, no distortion) ---
     with open(cam_path, "w", encoding="utf-8") as f:
         f.write("# Camera list with one line of data per camera:\n")
         f.write("#   CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n")
         f.write(f"1 PINHOLE {W} {H} {fx} {fy} {cx} {cy}\n")
 
-    # --- images.txt ---
+    # Mapping: (img_idx, kp_idx) -> point3d_id (1-based)
+    obs_to_p3d_id = {}
+    valid_p3d_indices = []
+    
+    if points3d and observations:
+        for pid, p in enumerate(points3d):
+            if p is None: continue
+            valid_p3d_indices.append(pid)
+            colmap_pid = pid + 1
+            # fix: unpack 3 elements
+            for (img_idx, kp_idx, uv) in observations[pid]:
+                obs_to_p3d_id[(img_idx, kp_idx)] = colmap_pid
+
     with open(img_path, "w", encoding="utf-8") as f:
         f.write("# Image list with two lines of data per image:\n")
         f.write("#   IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME\n")
         f.write("#   POINTS2D[] as (X, Y, POINT3D_ID)\n")
-        img_id = 1
-        for path, cam in zip(files, cameras):
+        
+        for i, (path, cam) in enumerate(zip(files, cameras)):
+            img_id = i + 1
             name = os.path.basename(path)
+            
             if cam is None:
-                f.write(f"# {img_id} {name} : pose missing\n\n")
-                img_id += 1
                 continue
-            R_cw, t_cw = cam  # world->camera
-            q_xyzw = R.from_matrix(R_cw).as_quat()  # [x,y,z,w]
-            qw, qx, qy, qz = float(q_xyzw[3]), float(q_xyzw[0]), float(q_xyzw[1]), float(q_xyzw[2])
+
+            R_cw, t_cw = cam
+            q = R.from_matrix(R_cw).as_quat()
+            qw, qx, qy, qz = float(q[3]), float(q[0]), float(q[1]), float(q[2])
             tx, ty, tz = float(t_cw[0]), float(t_cw[1]), float(t_cw[2])
+            
             f.write(f"{img_id} {qw} {qx} {qy} {qz} {tx} {ty} {tz} 1 {name}\n")
-            f.write("\n")
-            img_id += 1
+            
+            kps = keypoints[i]
+            p2d_strings = []
+            for k_idx, kp in enumerate(kps):
+                u, v = kp.pt
+                p3d_id = obs_to_p3d_id.get((i, k_idx), -1)
+                p2d_strings.append(f"{u:.4f} {v:.4f} {p3d_id}")
+            
+            f.write(" ".join(p2d_strings) + "\n")
 
-    # --- empty points3D.txt ---
     with open(pts3d_path, "w", encoding="utf-8") as f:
-        f.write("# 3D point list is empty for visualization\n")
-
-    print(f"[INFO] Wrote COLMAP txt to: {out_dir}")
+        f.write("# 3D point list with one line of data per point:\n")
+        f.write("#   POINT3D_ID, X, Y, Z, R, G, B, ERROR, TRACK[] as (IMAGE_ID, POINT2D_IDX)\n")
+        
+        for pid in valid_p3d_indices:
+            X = points3d[pid]
+            obs = observations[pid]
+            colmap_pid = pid + 1
+            
+            # fix: unpack 3 elements
+            img_idx, kp_idx, uv = obs[0]
+            u, v = uv
+            iy, ix = int(round(v)), int(round(u))
+            iy = max(0, min(iy, H-1))
+            ix = max(0, min(ix, W-1))
+            b, g, r = imgs_raw[img_idx][iy, ix]
+            
+            err_sum = 0.0
+            track_str_list = []
+            for (img_id_obs, kp_id_obs, uv_obs) in obs:
+                track_str_list.append(f"{img_id_obs + 1} {kp_id_obs}")
+                
+                cam = cameras[img_id_obs]
+                if cam:
+                    proj = project_point(K_used, cam[0], cam[1], X.reshape(3,1))
+                    if proj is not None:
+                        err_sum += np.linalg.norm(proj - uv_obs)
+            
+            mean_err = err_sum / len(obs) if len(obs) > 0 else 0.0
+            
+            f.write(f"{colmap_pid} {X[0]:.6f} {X[1]:.6f} {X[2]:.6f} {int(r)} {int(g)} {int(b)} {mean_err:.6f} ")
+            f.write(" ".join(track_str_list) + "\n")
+            
+    print(f"[INFO] Wrote COLMAP model (cameras, images, points3D) to: {out_dir}")
 # --------------------------------------------------------------------
 
 def _plot_scene_quick(cameras, points3d):
@@ -1011,12 +1006,6 @@ def main(image_dir, out_dir, poses_path=None, mode='sfm'):
         print("[info] No pose file provided. Running in Incremental SfM mode.")
         cameras, points3d, observations = run_incremental_sfm(files, K, keypoints, descriptors, imgs)
         mode_name = 'sfmMode'
-        
-        # sfm_poses_path = os.path.join(out_dir, "sfm_minimal", "sfm_computed_poses.json")
-        # save_poses_to_json(sfm_poses_path, cameras, files)
-        
-        colmap_out = os.path.join(out_dir, "sfm_minimal", "colmap_export")
-        _export_colmap_files(colmap_out, files, K, cameras)
 
     if cameras is None or observations is None:
         print("[ERROR] Reconstruction failed in the selected mode. Exiting.")
@@ -1055,6 +1044,10 @@ def main(image_dir, out_dir, poses_path=None, mode='sfm'):
 
     ply_path = os.path.join(out_dir, 'sfm_minimal', f"point_cloud_{mode_name}.ply")
     save_ply(ply_path, points3d, imgs_raw, observations)
+    
+    colmap_out_dir = os.path.join(out_dir, "sfm_minimal", "colmap_export")
+    _export_colmap_files(colmap_out_dir, files, K, cameras, keypoints, points3d, observations, imgs_raw)
+    
     print(f"[INFO] Finished writing outputs to {out_dir}")
 
 if __name__ == "__main__":
