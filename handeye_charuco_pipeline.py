@@ -791,6 +791,39 @@ def rotation_matrix_to_quaternion(R):
 
     return np.array([qw, qx, qy, qz], dtype=np.float64)
 
+def export_colmap_cameras(K, image_size, out_path, camera_id=1, model="PINHOLE"):
+    """
+    cameras.txt を COLMAP 形式で出力する。
+    3DGS で推奨される PINHOLE モデル (fx, fy, cx, cy) をデフォルトとする。
+    """
+    fx = K[0, 0]
+    fy = K[1, 1]
+    cx = K[0, 2]
+    cy = K[1, 2]
+    width, height = image_size
+
+    # ディレクトリが無ければ作成
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("# Camera list with one line of data per camera.\n")
+        f.write("# CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n")
+
+        if model == "PINHOLE":
+            # params: fx, fy, cx, cy
+            f.write(f"{camera_id} {model} {width} {height} "
+                    f"{fx:.16f} {fy:.16f} {cx:.16f} {cy:.16f}\n")
+        elif model == "SIMPLE_PINHOLE":
+            # params: f, cx, cy
+            f_avg = (fx + fy) / 2.0
+            f.write(f"{camera_id} {model} {width} {height} "
+                    f"{f_avg:.16f} {cx:.16f} {cy:.16f}\n")
+        else:
+            print(f"[WARN] Model {model} not fully supported in this simple exporter, using PINHOLE fallback.")
+            f.write(f"{camera_id} PINHOLE {width} {height} "
+                    f"{fx:.16f} {fy:.16f} {cx:.16f} {cy:.16f}\n")
+
+    print(f"[INFO] Wrote COLMAP cameras.txt to: {out_path}")
 
 def export_colmap_images(
     T_b_c_list,
@@ -809,6 +842,9 @@ def export_colmap_images(
         <空行>
     """
     assert len(T_b_c_list) == len(image_paths)
+    
+    # ディレクトリが無ければ作成
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
     with open(out_path, "w", encoding="utf-8") as f:
         for i, (T_b_c, img_path) in enumerate(zip(T_b_c_list, image_paths), start=1):
@@ -1029,14 +1065,28 @@ def main():
         show_reprojection=not args.no_show,
     )
 
-    # 5) COLMAP images.txt 出力
-    colmap_images_out = 'output/images.txt'
+    # 5) COLMAP 出力 (cameras.txt, images.txt)
+    output_dir = 'output'  # 出力先ディレクトリ
+    colmap_images_out = os.path.join(output_dir, 'images.txt')
+    colmap_cameras_out = os.path.join(output_dir, 'cameras.txt')
+
     if colmap_images_out is not None:
+        # images.txt 出力
         export_colmap_images(
             T_b_c_list=T_b_c_list,
             image_paths=used_image_paths,
             out_path=colmap_images_out,
             camera_id=1,
+        )
+
+    if colmap_cameras_out is not None:
+        # cameras.txt 出力 (PINHOLE モデル)
+        export_colmap_cameras(
+            K=K,
+            image_size=image_size,
+            out_path=colmap_cameras_out,
+            camera_id=1,
+            model="PINHOLE"
         )
 
 # -----可視化ブロック------
