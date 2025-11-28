@@ -133,7 +133,7 @@ def evaluate_euler_order(
         t_gripper2base,
         rvecs,
         tvecs,
-        method=cv2.CALIB_HAND_EYE_TSAI,
+        method=cv2.CALIB_HAND_EYE_DANIILIDIS,
     )
 
     # camera->gripper を 4x4 に
@@ -417,7 +417,7 @@ def calibrate_intrinsics(obj_points_all, img_points_all, image_size):
     return rms, K, dist, rvecs, tvecs
 
 
-def run_handeye(R_gripper2base, t_gripper2base, rvecs, tvecs, method=cv2.CALIB_HAND_EYE_TSAI):
+def run_handeye(R_gripper2base, t_gripper2base, rvecs, tvecs, method=cv2.CALIB_HAND_EYE_DANIILIDIS):
     """
     OpenCV の Hand-Eye を呼び出す。
 
@@ -494,7 +494,7 @@ def reconstruct_charuco_points_in_base(
     euler_order="XYZ",
     min_corners=15,
     min_views_per_id=3,
-    max_reproj_error_px=None,   # None ならフィルタしない
+    max_reproj_error_px=6.0,   # None ならフィルタしない
     show_reprojection=True,
 ):
     """
@@ -612,48 +612,79 @@ def reconstruct_charuco_points_in_base(
         if len(meas_list) < min_views_per_id:
             continue
 
-        norm_points = []
-        cam_poses = []
+        # --- まず全ビューを使って初期三角測量 ---
+        norm_points_all = []
+        cam_poses_all = []
         for m in meas_list:
-            norm_points.append((m["u_n"], m["v_n"]))
-            cam_poses.append((m["R_c_b"], m["t_c_b"]))
+            norm_points_all.append((m["u_n"], m["v_n"]))
+            cam_poses_all.append((m["R_c_b"], m["t_c_b"]))
 
         try:
-            X_b = triangulate_n_views(norm_points, cam_poses)
+            X_b = triangulate_n_views(norm_points_all, cam_poses_all)
         except np.linalg.LinAlgError:
             continue
 
-        # 再投影誤差（px）を計算
-        per_view_err = []
-        for m in meas_list:
-            R_c_b = m["R_c_b"]
-            t_c_b = m["t_c_b"]
-            u_px_obs = m["u_px"]
-            v_px_obs = m["v_px"]
+        def compute_per_view_errors(X_b, meas_list_local):
+            """1つの 3D 点 X_b に対する、各ビューの再投影誤差 [px] を返す。"""
+            errs = []
+            for m in meas_list_local:
+                R_c_b = m["R_c_b"]
+                t_c_b = m["t_c_b"]
+                u_px_obs = m["u_px"]
+                v_px_obs = m["v_px"]
 
-            # projectPoints 用の rvec,tvec
-            rvec, _ = cv2.Rodrigues(R_c_b)
-            X_obj = X_b.reshape(1, 3).astype(np.float32)
-            uv_proj, _ = cv2.projectPoints(
-                X_obj,
-                rvec.astype(np.float32),
-                t_c_b.astype(np.float32),
-                K,
-                dist,
-            )
-            u_px_pred, v_px_pred = uv_proj[0, 0, :]
+                # world(=base)->cam を rvec,tvec に変換
+                rvec, _ = cv2.Rodrigues(R_c_b)
+                X_obj = X_b.reshape(1, 3).astype(np.float32)
 
-            err = np.hypot(u_px_pred - u_px_obs, v_px_pred - v_px_obs)
-            per_view_err.append(err)
+                uv_proj, _ = cv2.projectPoints(
+                    X_obj,
+                    rvec.astype(np.float32),
+                    t_c_b.astype(np.float32),
+                    K,
+                    dist,
+                )
+                u_px_pred, v_px_pred = uv_proj[0, 0, :]
 
-        rms_px = float(np.sqrt(np.mean(np.square(per_view_err))))
+                err = float(np.hypot(u_px_pred - u_px_obs, v_px_pred - v_px_obs))
+                errs.append(err)
+            return np.array(errs, dtype=np.float32)
 
-        if (max_reproj_error_px is not None) and (rms_px > max_reproj_error_px):
-            # 外れ ID とみなしてスキップ
-            continue
+        # --- 初期解に対する per-view 誤差 ---
+        per_view_err = compute_per_view_errors(X_b, meas_list)
+        rms_px = float(np.sqrt(np.mean(per_view_err ** 2)))
 
+        # --- ビュー単位の外れ値除去＋再三角測量 ---
+        if (max_reproj_error_px is not None):
+            inlier_mask = per_view_err <= max_reproj_error_px
+
+            # inlier が少なすぎる場合はこの ID を破棄
+            if np.count_nonzero(inlier_mask) < min_views_per_id:
+                continue
+
+            # inlier のみで再三角測量
+            norm_points_in = [
+                (m["u_n"], m["v_n"])
+                for m, keep in zip(meas_list, inlier_mask) if keep
+            ]
+            cam_poses_in = [
+                (m["R_c_b"], m["t_c_b"])
+                for m, keep in zip(meas_list, inlier_mask) if keep
+            ]
+
+            try:
+                X_b = triangulate_n_views(norm_points_in, cam_poses_in)
+            except np.linalg.LinAlgError:
+                continue
+
+            # 最終的な誤差を inlier のみで再計算
+            meas_list_in = [m for m, keep in zip(meas_list, inlier_mask) if keep]
+            per_view_err = compute_per_view_errors(X_b, meas_list_in)
+
+        # --- ID 採用 ---
         id_to_Xb[cid] = X_b
-        all_err_px.extend(per_view_err)
+        all_err_px.extend(per_view_err.tolist())
+
 
     if not id_to_Xb:
         print("[WARN] No Charuco 3D points reconstructed after filtering")
@@ -1047,7 +1078,7 @@ def main():
         t_gripper2base,
         rvecs,
         tvecs,
-        method=cv2.CALIB_HAND_EYE_TSAI,
+        method=cv2.CALIB_HAND_EYE_DANIILIDIS,
     )
 
     # 4) カメラポーズ固定利用の Charuco 再構成
@@ -1061,7 +1092,7 @@ def main():
         euler_order="XYZ",
         min_corners=15,
         min_views_per_id=3,
-        max_reproj_error_px=None,  # 例: 3.0
+        max_reproj_error_px=6.0,  # 例: 3.0
         show_reprojection=not args.no_show,
     )
 
