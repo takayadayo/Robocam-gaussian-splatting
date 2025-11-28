@@ -205,152 +205,246 @@ def evaluate_euler_order(
     )
 
 
-def refine_handeye_by_board_consistency(
+def refine_handeye_and_board_pose_bundle_adjustment(
+    K,
+    dist,
     R_cam2gripper_init,
     t_cam2gripper_init,
+    obj_points_all,
+    img_points_all,
     robot_json_path,
     used_image_paths,
     rvecs,
     tvecs,
     euler_order="XYZ",
-    max_iters=15,
+    max_iters=20,
     lambda_init=1e-3,
     verbose=True,
 ):
     """
-    Hand-Eye の初期解 (^gR_c, ^gt_c) を、base 座標系でのボード姿勢の
-    ばらつきが最小になるように非線形最適化する。
+    Hand-Eye (^gT_c) と Charuco ボードの base 座標系における姿勢 (^bT_B) を
+    同時に最適化するバンドル調整処理。
 
-    - 入力
-        R_cam2gripper_init : (3,3) 初期回転 ^gR_c
-        t_cam2gripper_init : (3,1) 初期並進 ^gt_c [m]
-        robot_json_path    : ロボット pose JSON へのパス
-        used_image_paths   : calibrateCamera に実際に使った画像パス列
-        rvecs, tvecs       : calibrateCamera の出力 (board->camera) per view
-        euler_order        : base->gripper 生成時の Euler 順序（既定: "XYZ"）
-        max_iters          : 最大反復回数
-        lambda_init        : LM ダンピング初期値
-        verbose            : 進捗を print するか
+    - カメラ内部パラメータ K, dist は固定
+    - base->gripper はロボット JSON から取得して固定
+    - 未知変数は:
+        * Hand-Eye (camera->gripper) の 6 自由度
+        * base->board の 6 自由度
+    - 目的関数は、全画像・全 Charuco コーナに対する 2D 再投影誤差 (px) の二乗和
 
-    - 出力
-        R_cam2gripper_opt  : (3,3) 最適化後の ^gR_c
-        t_cam2gripper_opt  : (3,1) 最適化後の ^gt_c
+    引数:
+        K, dist:
+            カメラ内部・歪みパラメータ (calibrateCamera の結果)
+        R_cam2gripper_init, t_cam2gripper_init:
+            calibrateHandEye の初期解 (^gR_c, ^gt_c)
+        obj_points_all, img_points_all:
+            collect_charuco_and_robot_pairs() の返り値の一部。
+            obj_points_all[i] : (Ni x 3) board 座標系の 3D 点
+            img_points_all[i] : (Ni x 2) 画像上の 2D ピクセル座標
+        robot_json_path:
+            ロボット captures JSON へのパス
+        used_image_paths:
+            対応する画像パス列 (obj_points_all/img_points_all, rvecs/tvecs と同じ順序)
+        rvecs, tvecs:
+            calibrateCamera の外部パラメータ (board->camera)。初期 board 姿勢推定にのみ利用。
+    戻り値:
+        R_cam2gripper_opt, t_cam2gripper_opt, R_base2board_opt, t_base2board_opt
     """
+    # --- 補助関数: SO(3) の平均 ---
+    def average_rotations(R_list):
+        """
+        複数の回転行列 R_i のフレシェ平均を、
+        A = sum R_i に対する最近傍の回転行列として求める。
+        """
+        if len(R_list) == 0:
+            return np.eye(3, dtype=np.float64)
+        A = np.zeros((3, 3), dtype=np.float64)
+        for R in R_list:
+            A += R
+        U, _, Vt = np.linalg.svd(A)
+        R_avg = U @ Vt
+        if np.linalg.det(R_avg) < 0.0:
+            U[:, -1] *= -1.0
+            R_avg = U @ Vt
+        return R_avg
 
     robot_poses = load_robot_captures(robot_json_path)
 
-    # --- 初期パラメータ (rvec_cg, t_cg) を構成 ---
-    rvec_init, _ = cv2.Rodrigues(R_cam2gripper_init)
-    param = np.concatenate(
-        [rvec_init.reshape(3), t_cam2gripper_init.reshape(3)]
-    ).astype(np.float64)  # shape (6,)
+    # --- 初期 Hand-Eye から T_g_c_init を構成 ---
+    rvec_cg_init, _ = cv2.Rodrigues(R_cam2gripper_init)
+    T_g_c_init = np.eye(4, dtype=np.float64)
+    T_g_c_init[:3, :3] = R_cam2gripper_init
+    T_g_c_init[:3, 3] = t_cam2gripper_init.reshape(3)
 
-    def compute_board_poses(param_vec):
+    # --- calibrateCamera の外部パラメータとロボットポーズから、
+    #     各画像の base->board を一旦計算し、その平均を board 初期値にする ---
+    T_b_B_list = []
+    for i, img_path in enumerate(used_image_paths):
+        img_name = os.path.basename(img_path)
+        if img_name not in robot_poses:
+            continue
+
+        # base->gripper
+        T_b_g = pose_to_T_base_gripper(
+            robot_poses[img_name],
+            euler_order=euler_order,
+        )
+
+        # base->camera
+        T_b_c = T_b_g @ T_g_c_init
+
+        # camera->board (calibrateCamera の rvec, tvec は object->camera)
+        R_cb, _ = cv2.Rodrigues(rvecs[i])
+        t_cb = tvecs[i].reshape(3, 1)
+
+        T_c_B = np.eye(4, dtype=np.float64)
+        T_c_B[:3, :3] = R_cb
+        T_c_B[:3, 3] = t_cb[:, 0]
+
+        # base->board
+        T_b_B = T_b_c @ T_c_B
+        T_b_B_list.append(T_b_B)
+
+    # T_b_B_list から base->board の初期値を平均として構成
+    if len(T_b_B_list) == 0:
+        # 安全側: 原点 & 単位回転
+        R_bB_init = np.eye(3, dtype=np.float64)
+        t_bB_init = np.zeros((3, 1), dtype=np.float64)
+    else:
+        R_list = [T[:3, :3] for T in T_b_B_list]
+        t_list = [T[:3, 3] for T in T_b_B_list]
+        R_bB_init = average_rotations(R_list)
+        t_bB_init = np.mean(np.stack(t_list, axis=0), axis=0).reshape(3, 1)
+
+    rvec_bB_init, _ = cv2.Rodrigues(R_bB_init)
+
+    # --- パラメータベクトル [rvec_cg(3), t_cg(3), rvec_bB(3), t_bB(3)] ---
+    param = np.concatenate(
+        [
+            rvec_cg_init.reshape(3),
+            t_cam2gripper_init.reshape(3),
+            rvec_bB_init.reshape(3),
+            t_bB_init.reshape(3),
+        ]
+    ).astype(np.float64)  # (12,)
+
+    # --- 画像ごとのデータを整理 ---
+    view_data = []
+    for i, img_path in enumerate(used_image_paths):
+        img_name = os.path.basename(img_path)
+        if img_name not in robot_poses:
+            continue
+        if i >= len(obj_points_all) or i >= len(img_points_all):
+            continue
+        obj_pts = obj_points_all[i]
+        img_pts = img_points_all[i]
+        if obj_pts.shape[0] == 0:
+            continue
+        view_data.append(
+            dict(
+                img_name=img_name,
+                obj_pts=obj_pts.copy(),  # (Ni,3), board frame
+                img_pts=img_pts.copy(),  # (Ni,2), pixels
+            )
+        )
+
+    if len(view_data) == 0:
+        raise RuntimeError("No valid views for bundle adjustment")
+
+    # --- 残差関数: 全画像・全点の 2D 再投影誤差 (px) を連結 ---
+    def residuals(param_vec):
         """
-        現在の Hand-Eye パラメータから、各画像における base->board の
-        原点位置と法線ベクトルを計算する。
-        戻り値:
-            board_positions: (N,3)
-            board_normals:   (N,3) 正規化済
+        現在のパラメータでの 2D 再投影誤差ベクトルを返す。
+        形状: (2 * Σ Ni, )
         """
-        rvec_cg = param_vec[:3].reshape(3, 1)
-        t_cg = param_vec[3:].reshape(3, 1)
+        # パラメータのデコード
+        rvec_cg = param_vec[0:3].reshape(3, 1)
+        t_cg = param_vec[3:6].reshape(3, 1)
+        rvec_bB = param_vec[6:9].reshape(3, 1)
+        t_bB = param_vec[9:12].reshape(3, 1)
 
         R_cg, _ = cv2.Rodrigues(rvec_cg)  # ^gR_c
+        R_bB, _ = cv2.Rodrigues(rvec_bB)  # ^bR_B
+
+        # camera->gripper を 4x4
         T_g_c = np.eye(4, dtype=np.float64)
         T_g_c[:3, :3] = R_cg
         T_g_c[:3, 3] = t_cg[:, 0]
 
-        board_positions = []
-        board_normals = []
+        # base->board を 4x4
+        T_b_B = np.eye(4, dtype=np.float64)
+        T_b_B[:3, :3] = R_bB
+        T_b_B[:3, 3] = t_bB[:, 0]
 
-        for i, img_path in enumerate(used_image_paths):
-            img_name = os.path.basename(img_path)
+        residual_list = []
 
-            if img_name not in robot_poses:
-                # 念のためチェック（通常ここには来ない想定）
-                continue
+        for vd in view_data:
+            img_name = vd["img_name"]
+            obj_pts = vd["obj_pts"]  # (Ni,3) in board frame
+            img_pts = vd["img_pts"]  # (Ni,2) in pixels
+
+            pose_dict = robot_poses[img_name]
 
             # base->gripper
             T_b_g = pose_to_T_base_gripper(
-                robot_poses[img_name],
+                pose_dict,
                 euler_order=euler_order,
             )
 
             # base->camera
             T_b_c = T_b_g @ T_g_c
 
-            # camera->board (calibrateCamera の rvec, tvec は object->camera)
-            R_cb, _ = cv2.Rodrigues(rvecs[i])
-            t_cb = tvecs[i].reshape(3, 1)
+            # world(=base)->camera
+            R_c_b, t_c_b = base_to_cam_to_world_to_cam(T_b_c)
 
-            T_c_B = np.eye(4, dtype=np.float64)
-            T_c_B[:3, :3] = R_cb
-            T_c_B[:3, 3] = t_cb[:, 0]
+            # board->base を通じて 3D 点を base 座標系に変換
+            X_B = obj_pts.astype(np.float64)               # board frame
+            X_b = (R_bB @ X_B.T + t_bB).T                  # (Ni,3), base frame
 
-            # base->board
-            T_b_B = T_b_c @ T_c_B
+            # projectPoints は「world座標系 -> camera」の変換 (R_c_b, t_c_b) と
+            # world座標系上の 3D 点 (ここでは base 座標系の X_b) を受け取る
+            rvec_cb, _ = cv2.Rodrigues(R_c_b)
+            X_b32 = X_b.reshape(-1, 1, 3).astype(np.float32)
+            uv_pred, _ = cv2.projectPoints(
+                X_b32,
+                rvec_cb.astype(np.float32),
+                t_c_b.astype(np.float32),
+                K,
+                dist,
+            )
+            uv_pred = uv_pred.reshape(-1, 2).astype(np.float64)
 
-            p_b = T_b_B[:3, 3]
-            n_b = T_b_B[:3, :3] @ np.array([0.0, 0.0, 1.0], dtype=np.float64)
-            n_b = n_b / np.linalg.norm(n_b)
+            # 残差: ピクセル誤差
+            res_2d = (uv_pred - img_pts.astype(np.float64)).reshape(-1)  # (2*Ni,)
+            residual_list.append(res_2d)
 
-            board_positions.append(p_b)
-            board_normals.append(n_b)
+        if len(residual_list) == 0:
+            return np.zeros((0,), dtype=np.float64)
 
-        board_positions = np.stack(board_positions, axis=0)  # (N,3)
-        board_normals = np.stack(board_normals, axis=0)      # (N,3)
-        return board_positions, board_normals
+        return np.concatenate(residual_list, axis=0)
 
-    def residuals(param_vec):
-        """
-        現在のパラメータでの残差ベクトル (6N,) を返す。
-        - 位置: p_i - mean(p)
-        - 法線: n_i - mean(n) (mean(n) は正規化)
-        に重み付けしたものを連結。
-        """
-        board_positions, board_normals = compute_board_poses(param_vec)
-
-        pos_mean = board_positions.mean(axis=0)
-        n_mean = board_normals.mean(axis=0)
-        n_mean /= np.linalg.norm(n_mean)
-
-        w_pos = 1.0
-        w_ori = 0.5
-
-        res_pos = np.sqrt(w_pos) * (board_positions - pos_mean)  # (N,3)
-        res_ori = np.sqrt(w_ori) * (board_normals - n_mean)      # (N,3)
-
-        return np.hstack([res_pos.reshape(-1), res_ori.reshape(-1)])  # (6N,)
-
-    # --- 初期状態のスコアを出力 ---
-    board_positions0, board_normals0 = compute_board_poses(param)
-    pos_mean0 = board_positions0.mean(axis=0)
-    pos_dev0 = np.linalg.norm(board_positions0 - pos_mean0, axis=1)
-    pos_std0 = pos_dev0.std()
-
-    n_mean0 = board_normals0.mean(axis=0)
-    n_mean0 /= np.linalg.norm(n_mean0)
-    dots0 = np.clip(np.einsum("ij,j->i", board_normals0, n_mean0), -1.0, 1.0)
-    angles0 = np.arccos(dots0)
-    ori_std_deg0 = np.rad2deg(angles0).std()
-
+    # --- 初期コストを計算 ---
+    r0 = residuals(param)
+    cost0 = 0.5 * np.dot(r0, r0)
     if verbose:
-        print("[REFINE] Initial board scatter: "
-              f"pos_std={pos_std0*1000:.3f} mm, "
-              f"ori_std={ori_std_deg0:.4f} deg")
+        print(
+            f"[BA] Initial reprojection cost = {cost0:.6e}, "
+            f"RMS = {np.sqrt(2 * cost0 / r0.size):.3f} px"
+        )
 
-    # --- LM ループ ---
+    # --- Levenberg-Marquardt ループ ---
     lam = lambda_init
     eps = 1e-6
-    prev_cost = None
+    prev_cost = cost0
 
     for it in range(max_iters):
         r = residuals(param)
         cost = 0.5 * np.dot(r, r)
-
         if verbose:
-            print(f"[REFINE] iter={it:02d}, cost={cost:.6e}, lambda={lam:.3e}")
+            print(
+                f"[BA] iter={it:02d}, cost={cost:.6e}, "
+                f"RMS={np.sqrt(2 * cost / r.size):.3f} px, lambda={lam:.3e}"
+            )
 
         m = r.size
         n = param.size
@@ -370,7 +464,7 @@ def refine_handeye_by_board_consistency(
         try:
             step = np.linalg.solve(JTJ + lam * np.eye(n), JTr)
         except np.linalg.LinAlgError:
-            print("[REFINE] Singular JTJ, abort refinement.")
+            print("[BA] Singular JTJ, abort refinement.")
             break
 
         param_new = param - step
@@ -381,29 +475,61 @@ def refine_handeye_by_board_consistency(
             # 改善したので採用 & lambda を小さく
             param = param_new
             lam *= 0.5
-            if prev_cost is not None and abs(prev_cost - cost_new) < 1e-9:
+            if abs(cost - cost_new) < 1e-9:
                 if verbose:
-                    print("[REFINE] Converged (cost change small).")
+                    print("[BA] Converged (cost change small).")
                 break
             prev_cost = cost_new
         else:
             # 悪化したのでロールバック & lambda を増加
             lam *= 2.0
             if lam > 1e6:
-                print("[REFINE] lambda too large, abort refinement.")
+                print("[BA] lambda too large, abort refinement.")
                 break
 
         if np.linalg.norm(step) < 1e-8:
             if verbose:
-                print("[REFINE] Converged (step norm small).")
+                print("[BA] Converged (step norm small).")
             break
 
-    # --- 最終パラメータから Hand-Eye とスコアを算出 ---
-    rvec_opt = param[:3].reshape(3, 1)
-    t_opt = param[3:].reshape(3, 1)
-    R_cg_opt, _ = cv2.Rodrigues(rvec_opt)
+    # --- 最終パラメータから行列を復元 ---
+    rvec_cg_opt = param[0:3].reshape(3, 1)
+    t_cg_opt = param[3:6].reshape(3, 1)
+    rvec_bB_opt = param[6:9].reshape(3, 1)
+    t_bB_opt = param[9:12].reshape(3, 1)
 
-    board_positions, board_normals = compute_board_poses(param)
+    R_cg_opt, _ = cv2.Rodrigues(rvec_cg_opt)
+    R_bB_opt, _ = cv2.Rodrigues(rvec_bB_opt)
+
+    # 結果の評価として、base->board の位置・姿勢ばらつきを計算しておく
+    # （board は本来 base で静止しているので、ここはほぼ 0 に近いはず）
+    board_positions = []
+    board_normals = []
+
+    T_g_c_opt = np.eye(4, dtype=np.float64)
+    T_g_c_opt[:3, :3] = R_cg_opt
+    T_g_c_opt[:3, 3] = t_cg_opt[:, 0]
+
+    T_b_B_opt = np.eye(4, dtype=np.float64)
+    T_b_B_opt[:3, :3] = R_bB_opt
+    T_b_B_opt[:3, 3] = t_bB_opt[:, 0]
+
+    for vd in view_data:
+        img_name = vd["img_name"]
+        _pose_dict = robot_poses[img_name]
+
+        # board は T_b_B_opt で固定なので、全 view で同じになる想定だが、
+        # 数値安定性確認のため一応 scatter を算出しておく。
+        p_b = T_b_B_opt[:3, 3]
+        n_b = T_b_B_opt[:3, :3] @ np.array([0.0, 0.0, 1.0], dtype=np.float64)
+        n_b = n_b / np.linalg.norm(n_b)
+
+        board_positions.append(p_b)
+        board_normals.append(n_b)
+
+    board_positions = np.stack(board_positions, axis=0)
+    board_normals = np.stack(board_normals, axis=0)
+
     pos_mean = board_positions.mean(axis=0)
     pos_dev = np.linalg.norm(board_positions - pos_mean, axis=1)
     pos_std = pos_dev.std()
@@ -415,13 +541,13 @@ def refine_handeye_by_board_consistency(
     ori_std_deg = np.rad2deg(angles).std()
 
     if verbose:
-        print("[REFINE] Final board scatter: "
-              f"pos_std={pos_std*1000:.3f} mm, "
-              f"ori_std={ori_std_deg:.4f} deg")
-        print("[REFINE] Hand-Eye refinement done.")
+        print(
+            "[BA] Final board scatter: "
+            f"pos_std={pos_std*1000:.3f} mm, ori_std={ori_std_deg:.4f} deg"
+        )
+        print("[BA] Hand-Eye + board pose bundle adjustment done.")
 
-    return R_cg_opt, t_opt
-
+    return R_cg_opt, t_cg_opt, R_bB_opt, t_bB_opt
 
 
 
@@ -1291,7 +1417,7 @@ def main():
         image_size,
     )
 
-    # 3) Hand-Eye (XYZ オーダで十分良いことは既に確認済み)
+    # 3) Hand-Eye (XYZ オーダで十分良いことは既に確認済み) を初期解として取得
     R_cam2gripper, t_cam2gripper = run_handeye(
         R_gripper2base,
         t_gripper2base,
@@ -1300,21 +1426,30 @@ def main():
         method=cv2.CALIB_HAND_EYE_DANIILIDIS,
     )
 
-    # 3') Hand-Eye 行列だけの非線形リファイン
-    R_cam2gripper_refined, t_cam2gripper_refined = refine_handeye_by_board_consistency(
+    # 3') Hand-Eye + board pose に対するバンドル調整
+    (
+        R_cam2gripper_refined,
+        t_cam2gripper_refined,
+        R_base2board,
+        t_base2board,
+    ) = refine_handeye_and_board_pose_bundle_adjustment(
+        K=K,
+        dist=dist,
         R_cam2gripper_init=R_cam2gripper,
         t_cam2gripper_init=t_cam2gripper,
+        obj_points_all=obj_points_all,
+        img_points_all=img_points_all,
         robot_json_path=args.json,
         used_image_paths=used_image_paths,
         rvecs=rvecs,
         tvecs=tvecs,
         euler_order="XYZ",
-        max_iters=15,
+        max_iters=20,
         lambda_init=1e-3,
         verbose=True,
     )
 
-    # 以降の処理ではリファイン後の Hand-Eye を使用
+    # 以降の処理では BA 後の Hand-Eye を使用
     R_cam2gripper = R_cam2gripper_refined
     t_cam2gripper = t_cam2gripper_refined
 
@@ -1332,6 +1467,7 @@ def main():
         max_reproj_error_px=4.0,  # 例: 3.0
         show_reprojection=not args.no_show,
     )
+
 
     # 5) COLMAP 出力 (cameras.txt, images.txt)
     output_dir = 'output'  # 出力先ディレクトリ
