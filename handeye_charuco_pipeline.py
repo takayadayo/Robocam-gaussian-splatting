@@ -205,6 +205,225 @@ def evaluate_euler_order(
     )
 
 
+def refine_handeye_by_board_consistency(
+    R_cam2gripper_init,
+    t_cam2gripper_init,
+    robot_json_path,
+    used_image_paths,
+    rvecs,
+    tvecs,
+    euler_order="XYZ",
+    max_iters=15,
+    lambda_init=1e-3,
+    verbose=True,
+):
+    """
+    Hand-Eye の初期解 (^gR_c, ^gt_c) を、base 座標系でのボード姿勢の
+    ばらつきが最小になるように非線形最適化する。
+
+    - 入力
+        R_cam2gripper_init : (3,3) 初期回転 ^gR_c
+        t_cam2gripper_init : (3,1) 初期並進 ^gt_c [m]
+        robot_json_path    : ロボット pose JSON へのパス
+        used_image_paths   : calibrateCamera に実際に使った画像パス列
+        rvecs, tvecs       : calibrateCamera の出力 (board->camera) per view
+        euler_order        : base->gripper 生成時の Euler 順序（既定: "XYZ"）
+        max_iters          : 最大反復回数
+        lambda_init        : LM ダンピング初期値
+        verbose            : 進捗を print するか
+
+    - 出力
+        R_cam2gripper_opt  : (3,3) 最適化後の ^gR_c
+        t_cam2gripper_opt  : (3,1) 最適化後の ^gt_c
+    """
+
+    robot_poses = load_robot_captures(robot_json_path)
+
+    # --- 初期パラメータ (rvec_cg, t_cg) を構成 ---
+    rvec_init, _ = cv2.Rodrigues(R_cam2gripper_init)
+    param = np.concatenate(
+        [rvec_init.reshape(3), t_cam2gripper_init.reshape(3)]
+    ).astype(np.float64)  # shape (6,)
+
+    def compute_board_poses(param_vec):
+        """
+        現在の Hand-Eye パラメータから、各画像における base->board の
+        原点位置と法線ベクトルを計算する。
+        戻り値:
+            board_positions: (N,3)
+            board_normals:   (N,3) 正規化済
+        """
+        rvec_cg = param_vec[:3].reshape(3, 1)
+        t_cg = param_vec[3:].reshape(3, 1)
+
+        R_cg, _ = cv2.Rodrigues(rvec_cg)  # ^gR_c
+        T_g_c = np.eye(4, dtype=np.float64)
+        T_g_c[:3, :3] = R_cg
+        T_g_c[:3, 3] = t_cg[:, 0]
+
+        board_positions = []
+        board_normals = []
+
+        for i, img_path in enumerate(used_image_paths):
+            img_name = os.path.basename(img_path)
+
+            if img_name not in robot_poses:
+                # 念のためチェック（通常ここには来ない想定）
+                continue
+
+            # base->gripper
+            T_b_g = pose_to_T_base_gripper(
+                robot_poses[img_name],
+                euler_order=euler_order,
+            )
+
+            # base->camera
+            T_b_c = T_b_g @ T_g_c
+
+            # camera->board (calibrateCamera の rvec, tvec は object->camera)
+            R_cb, _ = cv2.Rodrigues(rvecs[i])
+            t_cb = tvecs[i].reshape(3, 1)
+
+            T_c_B = np.eye(4, dtype=np.float64)
+            T_c_B[:3, :3] = R_cb
+            T_c_B[:3, 3] = t_cb[:, 0]
+
+            # base->board
+            T_b_B = T_b_c @ T_c_B
+
+            p_b = T_b_B[:3, 3]
+            n_b = T_b_B[:3, :3] @ np.array([0.0, 0.0, 1.0], dtype=np.float64)
+            n_b = n_b / np.linalg.norm(n_b)
+
+            board_positions.append(p_b)
+            board_normals.append(n_b)
+
+        board_positions = np.stack(board_positions, axis=0)  # (N,3)
+        board_normals = np.stack(board_normals, axis=0)      # (N,3)
+        return board_positions, board_normals
+
+    def residuals(param_vec):
+        """
+        現在のパラメータでの残差ベクトル (6N,) を返す。
+        - 位置: p_i - mean(p)
+        - 法線: n_i - mean(n) (mean(n) は正規化)
+        に重み付けしたものを連結。
+        """
+        board_positions, board_normals = compute_board_poses(param_vec)
+
+        pos_mean = board_positions.mean(axis=0)
+        n_mean = board_normals.mean(axis=0)
+        n_mean /= np.linalg.norm(n_mean)
+
+        w_pos = 1.0
+        w_ori = 0.5
+
+        res_pos = np.sqrt(w_pos) * (board_positions - pos_mean)  # (N,3)
+        res_ori = np.sqrt(w_ori) * (board_normals - n_mean)      # (N,3)
+
+        return np.hstack([res_pos.reshape(-1), res_ori.reshape(-1)])  # (6N,)
+
+    # --- 初期状態のスコアを出力 ---
+    board_positions0, board_normals0 = compute_board_poses(param)
+    pos_mean0 = board_positions0.mean(axis=0)
+    pos_dev0 = np.linalg.norm(board_positions0 - pos_mean0, axis=1)
+    pos_std0 = pos_dev0.std()
+
+    n_mean0 = board_normals0.mean(axis=0)
+    n_mean0 /= np.linalg.norm(n_mean0)
+    dots0 = np.clip(np.einsum("ij,j->i", board_normals0, n_mean0), -1.0, 1.0)
+    angles0 = np.arccos(dots0)
+    ori_std_deg0 = np.rad2deg(angles0).std()
+
+    if verbose:
+        print("[REFINE] Initial board scatter: "
+              f"pos_std={pos_std0*1000:.3f} mm, "
+              f"ori_std={ori_std_deg0:.4f} deg")
+
+    # --- LM ループ ---
+    lam = lambda_init
+    eps = 1e-6
+    prev_cost = None
+
+    for it in range(max_iters):
+        r = residuals(param)
+        cost = 0.5 * np.dot(r, r)
+
+        if verbose:
+            print(f"[REFINE] iter={it:02d}, cost={cost:.6e}, lambda={lam:.3e}")
+
+        m = r.size
+        n = param.size
+        J = np.zeros((m, n), dtype=np.float64)
+
+        # 数値ヤコビアン（中心差分）
+        for j in range(n):
+            dp = np.zeros_like(param)
+            dp[j] = eps
+            r_p = residuals(param + dp)
+            r_m = residuals(param - dp)
+            J[:, j] = (r_p - r_m) / (2.0 * eps)
+
+        JTJ = J.T @ J
+        JTr = J.T @ r
+
+        try:
+            step = np.linalg.solve(JTJ + lam * np.eye(n), JTr)
+        except np.linalg.LinAlgError:
+            print("[REFINE] Singular JTJ, abort refinement.")
+            break
+
+        param_new = param - step
+        r_new = residuals(param_new)
+        cost_new = 0.5 * np.dot(r_new, r_new)
+
+        if cost_new < cost:
+            # 改善したので採用 & lambda を小さく
+            param = param_new
+            lam *= 0.5
+            if prev_cost is not None and abs(prev_cost - cost_new) < 1e-9:
+                if verbose:
+                    print("[REFINE] Converged (cost change small).")
+                break
+            prev_cost = cost_new
+        else:
+            # 悪化したのでロールバック & lambda を増加
+            lam *= 2.0
+            if lam > 1e6:
+                print("[REFINE] lambda too large, abort refinement.")
+                break
+
+        if np.linalg.norm(step) < 1e-8:
+            if verbose:
+                print("[REFINE] Converged (step norm small).")
+            break
+
+    # --- 最終パラメータから Hand-Eye とスコアを算出 ---
+    rvec_opt = param[:3].reshape(3, 1)
+    t_opt = param[3:].reshape(3, 1)
+    R_cg_opt, _ = cv2.Rodrigues(rvec_opt)
+
+    board_positions, board_normals = compute_board_poses(param)
+    pos_mean = board_positions.mean(axis=0)
+    pos_dev = np.linalg.norm(board_positions - pos_mean, axis=1)
+    pos_std = pos_dev.std()
+
+    n_mean = board_normals.mean(axis=0)
+    n_mean /= np.linalg.norm(n_mean)
+    dots = np.clip(np.einsum("ij,j->i", board_normals, n_mean), -1.0, 1.0)
+    angles = np.arccos(dots)
+    ori_std_deg = np.rad2deg(angles).std()
+
+    if verbose:
+        print("[REFINE] Final board scatter: "
+              f"pos_std={pos_std*1000:.3f} mm, "
+              f"ori_std={ori_std_deg:.4f} deg")
+        print("[REFINE] Hand-Eye refinement done.")
+
+    return R_cg_opt, t_opt
+
+
+
 
 def T_to_R_t(T):
     """4x4 同次変換から (R, t) を抽出"""
@@ -494,7 +713,7 @@ def reconstruct_charuco_points_in_base(
     euler_order="XYZ",
     min_corners=15,
     min_views_per_id=3,
-    max_reproj_error_px=6.0,   # None ならフィルタしない
+    max_reproj_error_px=4.0,   # None ならフィルタしない
     show_reprojection=True,
 ):
     """
@@ -1081,6 +1300,24 @@ def main():
         method=cv2.CALIB_HAND_EYE_DANIILIDIS,
     )
 
+    # 3') Hand-Eye 行列だけの非線形リファイン
+    R_cam2gripper_refined, t_cam2gripper_refined = refine_handeye_by_board_consistency(
+        R_cam2gripper_init=R_cam2gripper,
+        t_cam2gripper_init=t_cam2gripper,
+        robot_json_path=args.json,
+        used_image_paths=used_image_paths,
+        rvecs=rvecs,
+        tvecs=tvecs,
+        euler_order="XYZ",
+        max_iters=15,
+        lambda_init=1e-3,
+        verbose=True,
+    )
+
+    # 以降の処理ではリファイン後の Hand-Eye を使用
+    R_cam2gripper = R_cam2gripper_refined
+    t_cam2gripper = t_cam2gripper_refined
+
     # 4) カメラポーズ固定利用の Charuco 再構成
     id_to_Xb, T_b_c_list, used_image_paths = reconstruct_charuco_points_in_base(
         image_dir=args.image_dir,
@@ -1092,7 +1329,7 @@ def main():
         euler_order="XYZ",
         min_corners=15,
         min_views_per_id=3,
-        max_reproj_error_px=6.0,  # 例: 3.0
+        max_reproj_error_px=4.0,  # 例: 3.0
         show_reprojection=not args.no_show,
     )
 
