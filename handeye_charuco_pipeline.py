@@ -28,6 +28,8 @@ from cv2 import aruco
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 (for 3D)
 
+from typing import Dict
+
 # ---------------------------------------------------------------
 # 基本ユーティリティ
 # ---------------------------------------------------------------
@@ -1240,6 +1242,13 @@ def export_colmap_images(
 
     print(f"[INFO] Wrote COLMAP images.txt to: {out_path}")
 
+def save_yaml(path: str, data: Dict[str, np.ndarray]):
+    fs = cv2.FileStorage(path, cv2.FILE_STORAGE_WRITE)
+    if not fs.isOpened():
+        raise RuntimeError(f"Could not open {path} for writing.")
+    for k, v in data.items():
+        fs.write(k, np.array(v))
+    fs.release()
 
 # ---------------------------------------------------------------
 # 可視化
@@ -1492,6 +1501,18 @@ def main():
             camera_id=1,
             model="PINHOLE"
         )
+    
+    # 内部パラメータ出力
+    intrinsics_path = os.path.join("sfm_out/intrinsics.yaml")
+    save_yaml(
+        intrinsics_path,
+        {
+            "K": K,
+            "dist": dist,
+            "rms": np.array([[rms]], dtype=np.float64),
+        },
+    )
+    print(f"[INFO] wrote intrinsics to {intrinsics_path}")
 
 # -----可視化ブロック------
 
