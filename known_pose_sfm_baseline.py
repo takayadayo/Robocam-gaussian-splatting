@@ -67,6 +67,10 @@ class BaselineConfig:
     tri_min_angle_deg: float = 3.0   # ★ 1.5→2.0deg（COLMAP推奨より少しだけ強め）
     use_two_view_tracks_for_eval: bool = False
     use_two_view_tracks_for_gs: bool = True
+    
+    # Track quality classification
+    strong_track_min_angle_deg: float = 10.0  # ≧この視差角 or 長さ≥4なら強トラック
+    weak_track_min_angle_deg: float = 4.0    # ≧この視差角なら弱トラック候補
 
     # BA loss / filtering (px → 後で正規化)
     ba_loss_scale_px: float = 1.0    # ★ ロバスト閾値もやや厳しく
@@ -75,7 +79,7 @@ class BaselineConfig:
     obs_drop_thresh_px: float = 1.0        # ★ 観測落としは 3px
 
     # BA iterations
-    ba_max_nfev: int = 200
+    ba_max_nfev: int = 500
 
 
 
@@ -248,7 +252,6 @@ def resize_for_max_size(img: np.ndarray, max_size: int) -> Tuple[np.ndarray, flo
     else:
         return img, scale
 
-
 def extract_features(
     image_dir: str,
     images: Dict[int, ImageInfo],
@@ -261,19 +264,19 @@ def extract_features(
       - detect SIFT keypoints
       - compute descriptors
       - convert to RootSIFT
-      - keep top max_num_features by response
+      - select features with grid-based spatial distribution
       - compute undistorted normalized coordinates using K, dist
     """
-    # COLMAP の SiftExtraction に近づける:
-    # - nfeatures = 0 で内部制限なし（後段で max_num_features にクリップ）
-    # - contrastThreshold ≈ peak_threshold = 0.0067 に合わせて低めに設定
-    # - edgeThreshold = 10, sigma = 1.6 は論文・COLMAPと同等
+    # COLMAPに近いSIFT設定（peak_threshold ≈ 0.0067）
     sift = cv2.SIFT_create(
-        nfeatures=0,              # 後段で手動で max_num_features に制限
-        contrastThreshold=0.0067, # COLMAP の peak_threshold に合わせる 
+        nfeatures=0,              # 上限無し、後段で max_num_features 制限
+        contrastThreshold=0.0067,
         edgeThreshold=10,
         sigma=1.6,
     )
+
+    grid_cols = 8
+    grid_rows = 6
 
     for image_id, info in images.items():
         img_path = os.path.join(image_dir, info.name)
@@ -281,33 +284,84 @@ def extract_features(
         if img is None:
             raise FileNotFoundError(f"Failed to read image: {img_path}")
 
+        h_orig, w_orig = img.shape[:2]
         img_resized, scale = resize_for_max_size(img, config.max_image_size)
 
         # Detect and compute
         keypoints, descriptors = sift.detectAndCompute(img_resized, None)
 
         if descriptors is None or len(keypoints) == 0:
-            # 空でも後で処理できるようにしておく
             info.keypoints_px = np.zeros((0, 2), dtype=np.float32)
             info.keypoints_norm = np.zeros((0, 2), dtype=np.float32)
             info.descriptors = np.zeros((0, 128), dtype=np.float32)
             continue
 
-        # RootSIFT 正規化
+        # RootSIFT
         descriptors = rootsift(descriptors)
 
-        # 元のスケールに戻す (keypoint 座標)
+        # 元スケール座標に戻す
         pts_px = np.array([kp.pt for kp in keypoints], dtype=np.float32)
         pts_px /= scale
 
-        # response 上位 max_num_features のみ残す
-        if len(keypoints) > config.max_num_features:
-            responses = np.array([kp.response for kp in keypoints])
-            idx = np.argsort(-responses)[: config.max_num_features]
-            pts_px = pts_px[idx]
-            descriptors = descriptors[idx]
+        num_kp = pts_px.shape[0]
 
-        # undistort + normalized coordinates
+        # グリッドごとに特徴点を均等に分布させる
+        if num_kp > config.max_num_features:
+            # 各セルに [ (response, idx), ... ]
+            cell_lists: List[List[List[Tuple[float, int]]]] = [
+                [[] for _ in range(grid_cols)] for _ in range(grid_rows)
+            ]
+
+            for idx, kp in enumerate(keypoints):
+                x, y = pts_px[idx]
+                c = int(x / max(w_orig, 1e-6) * grid_cols)
+                r = int(y / max(h_orig, 1e-6) * grid_rows)
+                c = min(max(c, 0), grid_cols - 1)
+                r = min(max(r, 0), grid_rows - 1)
+                cell_lists[r][c].append((kp.response, idx))
+
+            # 各セルから quota 個ずつピックアップ
+            total_cells = grid_rows * grid_cols
+            base_quota = max(config.max_num_features // total_cells, 1)
+
+            selected_indices = set()
+            leftovers: List[Tuple[float, int]] = []
+
+            for r in range(grid_rows):
+                for c in range(grid_cols):
+                    cell = cell_lists[r][c]
+                    if not cell:
+                        continue
+                    cell_sorted = sorted(cell, key=lambda x: -x[0])
+                    # まずセルごとの quota を取る
+                    for resp, idx in cell_sorted[:base_quota]:
+                        selected_indices.add(idx)
+                    # 余りは後でグローバル選抜用に保存
+                    for resp, idx in cell_sorted[base_quota:]:
+                        leftovers.append((resp, idx))
+
+            # quota 合計が max_num_features に足りなければ、余りから補充
+            if len(selected_indices) < config.max_num_features and leftovers:
+                remaining = config.max_num_features - len(selected_indices)
+                leftovers_sorted = sorted(leftovers, key=lambda x: -x[0])
+                for resp, idx in leftovers_sorted[:remaining]:
+                    selected_indices.add(idx)
+
+            # それでも多すぎる場合は全体レスポンス上位に制限
+            if len(selected_indices) > config.max_num_features:
+                # 選ばれた idx だけで再度レスポンス上位を取る
+                selected_list = list(selected_indices)
+                responses = np.array([keypoints[i].response for i in selected_list])
+                order = np.argsort(-responses)[: config.max_num_features]
+                final_indices = [selected_list[i] for i in order]
+            else:
+                final_indices = sorted(selected_indices)
+
+            pts_px = pts_px[final_indices]
+            descriptors = descriptors[final_indices]
+        # num_kp <= max_num_features の場合はそのまま
+
+        # undistort + normalized
         K = info.K
         dist = info.dist
         pts_undist = cv2.undistortPoints(
@@ -542,31 +596,30 @@ def symmetric_epipolar_distance_sq(
     return d_sym_sq
 
 
-
 def match_features_for_pair(
     img_i: ImageInfo,
     img_j: ImageInfo,
     config: BaselineConfig,
     f_mean: float,
+    scene_center: np.ndarray,
 ) -> List[Tuple[int, int]]:
     """
     Returns list of (kp_idx_i, kp_idx_j) after:
       - Lowe ratio
       - cross-check
       - known-pose-based geometric verification using Essential matrix E_known
+        with angle-dependent threshold.
 
     ポイント:
-      - Two-view の幾何モデルは既に既知ポーズから一意に決まるので、
-        RANSAC で E を推定し直さず、E_known に対する symmetric epipolar distance で
-        インライア判定を行う。
-      - 阈値は「px 単位のエピポーラ誤差」を f_mean で割って正規化した値に基づく。
+      - Two-view 幾何モデルは known pose から一意に決まる。
+      - ペアの視差角が小さいほどエピポーラ誤差に厳しく、大きいほどやや緩める。
     """
     desc1 = img_i.descriptors
     desc2 = img_j.descriptors
     if desc1 is None or desc2 is None or len(desc1) < 2 or len(desc2) < 2:
         return []
 
-    # 1) Lowe ratio + cross-check による候補マッチ
+    # 1) Lowe ratio + cross-check
     best_ij = collect_best_matches(desc1, desc2, config)
     best_ji = collect_best_matches(desc2, desc1, config)
 
@@ -580,16 +633,42 @@ def match_features_for_pair(
     if len(mutual_pairs) < config.geom_min_num_inliers:
         return []
 
-    # 2) Known pose から Essential 行列を計算し、symmetric epipolar distance でフィルタ
+    # 2) ペア視差角の近似評価（カメラ中心→scene_center の方向）
+    Ci = img_i.C
+    Cj = img_j.C
+    vi = scene_center - Ci
+    vj = scene_center - Cj
+    ni = np.linalg.norm(vi)
+    nj = np.linalg.norm(vj)
+    if ni < 1e-8 or nj < 1e-8:
+        angle_pair_deg = 5.0
+    else:
+        vi /= ni
+        vj /= nj
+        cos_th = float(np.clip(np.dot(vi, vj), -1.0, 1.0))
+        angle_pair_deg = float(np.degrees(np.arccos(cos_th)))
+
+    # 3) Known pose から Essential 行列
     pts1 = np.float64([img_i.keypoints_norm[i] for (i, _) in mutual_pairs])
     pts2 = np.float64([img_j.keypoints_norm[j] for (_, j) in mutual_pairs])
 
     E_known = compute_known_essential_matrix(img_i, img_j)
     d_sym_sq = symmetric_epipolar_distance_sq(E_known, pts1, pts2)
 
-    # px ベースの許容エピポーラ誤差 → 正規化座標系へ換算
-    #   th_norm ≈ (geom_max_error_px / f_mean)
-    th_norm = config.geom_max_error_px / max(f_mean, 1e-6)
+    # 4) 視差角に応じてエピポーラ閾値をスケーリング
+    #    - angle <= 2deg なら 0.5 * geom_max_error_px
+    #    - angle >= 5deg なら 1.0 * geom_max_error_px
+    #    - その間は線形補間
+    base_px = config.geom_max_error_px
+    if angle_pair_deg <= 2.0:
+        scale = 0.5
+    elif angle_pair_deg >= 5.0:
+        scale = 1.0
+    else:
+        t = (angle_pair_deg - 2.0) / (5.0 - 2.0)
+        scale = 0.5 + 0.5 * t
+
+    th_norm = (base_px * scale) / max(f_mean, 1e-6)
     th_norm_sq = th_norm * th_norm
 
     inlier_mask = d_sym_sq <= th_norm_sq
@@ -598,7 +677,6 @@ def match_features_for_pair(
     if len(inlier_pairs) < config.geom_min_num_inliers:
         return []
 
-    # Two-view RANSAC は行わず、known E による幾何検証のみでインライア集合を確定
     return inlier_pairs
 
 
@@ -618,16 +696,20 @@ def match_all_pairs(
     fy = some_info.K[1, 1]
     f_mean = 0.5 * (fx + fy)
 
+    # 視差角評価用のシーン中心
+    scene_center = compute_scene_center(images)
+
     all_matches: List[Tuple[int, int, int, int]] = []
 
     for (i, j) in pairs:
         img_i = images[i]
         img_j = images[j]
-        inlier_pairs = match_features_for_pair(img_i, img_j, config, f_mean)
+        inlier_pairs = match_features_for_pair(img_i, img_j, config, f_mean, scene_center)
         for kp_i, kp_j in inlier_pairs:
             all_matches.append((i, kp_i, j, kp_j))
 
     return all_matches
+
 
 
 # ============================================================
@@ -780,6 +862,53 @@ def compute_reproj_errors_norm(
     return np.vstack(residuals)
 
 
+def compute_min_triangulation_angle_deg(
+    track: List[Tuple[int, int]],
+    images: Dict[int, ImageInfo],
+    Xw: np.ndarray,
+) -> float:
+    """
+    現在の3D点 Xw を仮定したときの、track内の全カメラペアにおける
+    三角測量角の最小値（deg）を返す。
+    ここでは Xw 周りのカメラ中心ベクトルのなす角を計算する。
+    """
+    if Xw.ndim == 1:
+        X = Xw.reshape(3)
+    else:
+        X = Xw.reshape(3)
+
+    min_angle_deg = 180.0
+    n = len(track)
+    if n < 2:
+        return 0.0
+
+    for i in range(n):
+        img_id_i, _ = track[i]
+        Ci = images[img_id_i].C
+        vi = X - Ci
+        nvi = np.linalg.norm(vi)
+        if nvi < 1e-8:
+            continue
+        vi /= nvi
+        for j in range(i + 1, n):
+            img_id_j, _ = track[j]
+            Cj = images[img_id_j].C
+            vj = X - Cj
+            nvj = np.linalg.norm(vj)
+            if nvj < 1e-8:
+                continue
+            vj /= nvj
+            cos_th = float(np.clip(np.dot(vi, vj), -1.0, 1.0))
+            ang = np.degrees(np.arccos(cos_th))
+            if ang < min_angle_deg:
+                min_angle_deg = ang
+
+    if min_angle_deg == 180.0:
+        return 0.0
+    return float(min_angle_deg)
+
+
+
 def refine_point_ba(
     X0: np.ndarray,
     track: List[Tuple[int, int]],
@@ -789,7 +918,26 @@ def refine_point_ba(
 ) -> np.ndarray:
     """
     Point-only BA with Huber loss on normalized residuals.
+    三角測量角が小さいトラックほど Huber のスケールを小さくしてロバスト化する。
     """
+
+    # 初期三角測量角（deg）を評価
+    alpha = compute_min_triangulation_angle_deg(track, images, X0)
+    # tri_min_angle_deg〜strong_track_min_angle_degの間で [0.5, 1.0] に線形写像
+    tri_min = config.tri_min_angle_deg
+    tri_strong = max(config.strong_track_min_angle_deg, tri_min + 1e-3)
+
+    if alpha <= tri_min:
+        angle_scale = 0.5
+    elif alpha >= tri_strong:
+        angle_scale = 1.0
+    else:
+        t = (alpha - tri_min) / (tri_strong - tri_min)
+        angle_scale = 0.5 + 0.5 * t
+
+    # px → 正規化座標での Huber f_scale
+    base_scale_px = config.ba_loss_scale_px
+    f_scale_norm = (base_scale_px / max(f_mean, 1e-6)) * angle_scale
 
     def residuals(x: np.ndarray) -> np.ndarray:
         X = x.reshape(3, 1)
@@ -801,7 +949,6 @@ def refine_point_ba(
             X_cam = R @ X + t
             z = float(X_cam[2, 0])
             if z <= 1e-8:
-                # Behind camera -> large residual to push away
                 res_list.extend([1e3, 1e3])
                 continue
             xn = X_cam[0, 0] / z
@@ -810,9 +957,6 @@ def refine_point_ba(
             res_list.append(xn - obs[0])
             res_list.append(yn - obs[1])
         return np.array(res_list, dtype=np.float64)
-
-    # px -> normalized のスケール
-    f_scale_norm = config.ba_loss_scale_px / max(f_mean, 1e-6)
 
     result = least_squares(
         residuals,
@@ -828,6 +972,7 @@ def refine_point_ba(
     return X_refined
 
 
+
 def filter_and_collect_points(
     tracks: List[List[Tuple[int, int]]],
     images: Dict[int, ImageInfo],
@@ -836,135 +981,189 @@ def filter_and_collect_points(
     """
     Triangulate + iterative point-only BA + filtering.
 
+    - track を強トラック／弱トラックに分類し、強トラックから先に処理
+    - 三角測量角に依存した BA ロバストスケールと reprojection 閾値を適用
+
     Returns:
       points_gs:  3D points for 3DGS (track_len >= 2, after filtering)
       points_eval: 3D points for evaluation (track_len >= 3, after filtering)
       reps_gs: list of (image_id, kp_idx) representing each 3DGS point
     """
+    if not tracks:
+        return (
+            np.zeros((0, 3), dtype=np.float64),
+            np.zeros((0, 3), dtype=np.float64),
+            [],
+        )
+
     # 平均焦点距離
     some_info = next(iter(images.values()))
     fx = some_info.K[0, 0]
     fy = some_info.K[1, 1]
     f_mean = 0.5 * (fx + fy)
 
-    # px ベースの閾値を正規化座標系に換算
-    mean_thresh_norm = config.point_mean_reproj_max_px / max(f_mean, 1e-6)
-    max_thresh_norm = config.point_max_reproj_max_px / max(f_mean, 1e-6)
+    # pxベースの閾値を正規化座標系へ
+    base_mean_thresh_norm = config.point_mean_reproj_max_px / max(f_mean, 1e-6)
+    base_max_thresh_norm = config.point_max_reproj_max_px / max(f_mean, 1e-6)
     obs_drop_thresh_norm = config.obs_drop_thresh_px / max(f_mean, 1e-6)
 
-    points_gs = []
-    points_eval = []
-    reps_gs: List[Tuple[int, int]] = []
+    # シーン中心で擬似的な視差角を計算し、トラックを強／弱に分類
+    scene_center = compute_scene_center(images)
+    strong_tracks: List[List[Tuple[int, int]]] = []
+    weak_tracks: List[List[Tuple[int, int]]] = []
 
     for track in tracks:
         if len(track) < 2:
             continue
 
-        # ---- 反復: (線形三角測量 → 点のみBA → 観測除外 → 再三角測量) を最大2回 ----
-        current_track = list(track)
-        X_ref = None
-        success = False
-        iteration_num = 2
-
-        for _iter in range(iteration_num):
-            # (a) 線形三角測量
-            X0 = triangulate_track_linear(current_track, images)
-            if X0 is None:
-                success = False
-                break
-
-            # (b) 点のみBA
-            X_ref = refine_point_ba(X0, current_track, images, config, f_mean)
-
-            # (c) 再投影誤差を計算し、高誤差観測を除外
-            res = compute_reproj_errors_norm(X_ref, current_track, images)  # (M,2)
-            errs = np.linalg.norm(res, axis=1)  # (M,)
-
-            good_idx = np.where(errs <= obs_drop_thresh_norm)[0]
-            if len(good_idx) < 2:
-                success = False
-                break
-
-            # 観測更新
-            new_track = [current_track[k] for k in good_idx]
-
-            # 観測が一切落ちていなければ収束とみなす
-            if len(new_track) == len(current_track):
-                success = True
-                current_track = new_track
-                break
-            else:
-                current_track = new_track
-                # もう1回ループして「更新された観測集合」で再三角測量・BA を行う
-
-        if not success or X_ref is None:
-            # 2回の反復で安定しなければ破棄
-            continue
-
-        # ---- 最終観測集合での誤差評価 ----
-        res_final = compute_reproj_errors_norm(X_ref, current_track, images)
-        errs_final = np.linalg.norm(res_final, axis=1)
-
-        mean_err = float(errs_final.mean())
-        max_err = float(errs_final.max())
-        if mean_err > mean_thresh_norm or max_err > max_thresh_norm:
-            continue
-
-        # 全視点で前方性チェック
-        Xw = X_ref.reshape(3, 1)
-        front_ok = True
-        for img_id, _ in current_track:
-            info = images[img_id]
-            X_cam = info.R_cw @ Xw + info.t_cw.reshape(3, 1)
-            if X_cam[2, 0] <= 1e-6:
-                front_ok = False
-                break
-        if not front_ok:
-            continue
-
-        # 最小視差角チェック
+        # track に含まれる画像の視線方向（カメラ中心→scene_center）から近似三角測量角を計算
         min_angle_deg = 180.0
-        for i in range(len(current_track)):
-            img_id_i, _ = current_track[i]
-            Ci = images[img_id_i].C
-            vi = (Xw.ravel() - Ci)
-            norm_vi = np.linalg.norm(vi)
-            if norm_vi < 1e-8:
+        n = len(track)
+        dirs = []
+        for img_id, _ in track:
+            Ci = images[img_id].C
+            v = scene_center - Ci
+            nv = np.linalg.norm(v)
+            if nv < 1e-8:
                 continue
-            vi /= norm_vi
-            for j in range(i + 1, len(current_track)):
-                img_id_j, _ = current_track[j]
-                Cj = images[img_id_j].C
-                vj = (Xw.ravel() - Cj)
-                norm_vj = np.linalg.norm(vj)
-                if norm_vj < 1e-8:
-                    continue
-                vj /= norm_vj
-                cos_ang = float(np.clip(np.dot(vi, vj), -1.0, 1.0))
-                ang_deg = np.degrees(np.arccos(cos_ang))
-                if ang_deg < min_angle_deg:
-                    min_angle_deg = ang_deg
-
-        if min_angle_deg < config.tri_min_angle_deg:
+            dirs.append(v / nv)
+        if len(dirs) < 2:
+            # 視差角評価不可 → 弱トラック扱い
+            weak_tracks.append(track)
             continue
 
-        # ---- 出力集合への登録 ----
-        X_final = Xw.ravel()
+        for i in range(len(dirs)):
+            for j in range(i + 1, len(dirs)):
+                cos_th = float(np.clip(np.dot(dirs[i], dirs[j]), -1.0, 1.0))
+                ang = np.degrees(np.arccos(cos_th))
+                if ang < min_angle_deg:
+                    min_angle_deg = ang
+        if min_angle_deg == 180.0:
+            min_angle_deg = 0.0
 
-        # この点に対する「最も誤差の小さい観測」を代表観測として記録
-        res_final = compute_reproj_errors_norm(X_ref, current_track, images)
-        errs_final = np.linalg.norm(res_final, axis=1)
-        best_idx = int(np.argmin(errs_final))
-        rep_obs = current_track[best_idx]  # (image_id, kp_idx)
+        # 分類ロジック：
+        # - 視差角が十分大きい (>= strong_track_min_angle_deg) または track長>=4 → 強
+        # - 視差角が弱閾値以上 → 弱
+        # - それ未満 → 処理対象外（幾何的にあまり意味がない）
+        if min_angle_deg >= config.strong_track_min_angle_deg or len(track) >= 4:
+            strong_tracks.append(track)
+        elif min_angle_deg >= config.weak_track_min_angle_deg:
+            weak_tracks.append(track)
+        else:
+            # 非常に小さな視差角しかないトラックはスキップ
+            continue
 
-        # 3DGS用 (>=2視点)
-        if config.use_two_view_tracks_for_gs and len(current_track) >= 2:
-            points_gs.append(X_final)
-            reps_gs.append(rep_obs)
+    points_gs: List[np.ndarray] = []
+    points_eval: List[np.ndarray] = []
+    reps_gs: List[Tuple[int, int]] = []
 
-        # 評価用 (>=3視点)
-        if (not config.use_two_view_tracks_for_eval) and len(current_track) >= 3:
-            points_eval.append(X_final)
+    def process_track_list(track_list: List[List[Tuple[int, int]]]) -> None:
+        nonlocal points_gs, points_eval, reps_gs
+
+        for track in track_list:
+            if len(track) < 2:
+                continue
+
+            # ---- 最大2回の (線形三角測量 → 点のみBA → 観測除外) 反復 ----
+            current_track = list(track)
+            X_ref = None
+            success = False
+
+            for _iter in range(2):
+                # (a) 線形三角測量
+                X0 = triangulate_track_linear(current_track, images)
+                if X0 is None:
+                    success = False
+                    break
+
+                # (b) 点のみBA（角度依存の Huber スケール）
+                X_ref = refine_point_ba(X0, current_track, images, config, f_mean)
+
+                # (c) 再投影誤差で高誤差観測を除外
+                res = compute_reproj_errors_norm(X_ref, current_track, images)  # (M,2)
+                errs = np.linalg.norm(res, axis=1)
+
+                good_idx = np.where(errs <= obs_drop_thresh_norm)[0]
+                if len(good_idx) < 2:
+                    success = False
+                    break
+
+                new_track = [current_track[k] for k in good_idx]
+
+                # 観測が変化しなくなれば収束
+                if len(new_track) == len(current_track):
+                    success = True
+                    current_track = new_track
+                    break
+                else:
+                    current_track = new_track
+
+            if not success or X_ref is None:
+                continue
+
+            # ---- 最終観測集合での誤差・角度評価 ----
+            res_final = compute_reproj_errors_norm(X_ref, current_track, images)
+            errs_final = np.linalg.norm(res_final, axis=1)
+
+            mean_err = float(errs_final.mean())
+            max_err = float(errs_final.max())
+
+            # 実三角測量角（deg）を計算
+            Xw = X_ref.reshape(3, 1)
+            min_angle_deg = compute_min_triangulation_angle_deg(current_track, images, Xw)
+
+            # tri_min_angle_deg 未満なら不採用
+            if min_angle_deg < config.tri_min_angle_deg:
+                continue
+
+            # 角度に応じて reprojection 閾値をスケーリング
+            tri_min = config.tri_min_angle_deg
+            tri_strong = max(config.strong_track_min_angle_deg, tri_min + 1e-3)
+            if min_angle_deg <= tri_min:
+                angle_scale = 0.5
+            elif min_angle_deg >= tri_strong:
+                angle_scale = 1.0
+            else:
+                t = (min_angle_deg - tri_min) / (tri_strong - tri_min)
+                angle_scale = 0.5 + 0.5 * t
+
+            mean_thresh_norm = base_mean_thresh_norm * angle_scale
+            max_thresh_norm = base_max_thresh_norm * angle_scale
+
+            if mean_err > mean_thresh_norm or max_err > max_thresh_norm:
+                continue
+
+            # 全視点で前方性チェック
+            front_ok = True
+            for img_id, _ in current_track:
+                info = images[img_id]
+                X_cam = info.R_cw @ Xw + info.t_cw.reshape(3, 1)
+                if X_cam[2, 0] <= 1e-6:
+                    front_ok = False
+                    break
+            if not front_ok:
+                continue
+
+            # ---- 出力集合への登録 ----
+            X_final = Xw.ravel()
+
+            # 代表観測: 最も reprojection error が小さい観測
+            best_idx = int(np.argmin(errs_final))
+            rep_obs = current_track[best_idx]  # (image_id, kp_idx)
+
+            # 3DGS用 (>=2視点)
+            if config.use_two_view_tracks_for_gs and len(current_track) >= 2:
+                points_gs.append(X_final)
+                reps_gs.append(rep_obs)
+
+            # 評価用 (>=3視点)
+            if (not config.use_two_view_tracks_for_eval) and len(current_track) >= 3:
+                points_eval.append(X_final)
+
+    # まず強トラックを処理して骨格点群を得る
+    process_track_list(strong_tracks)
+    # その後、弱トラックを処理して不足分を補う
+    process_track_list(weak_tracks)
 
     if len(points_gs) == 0:
         points_gs_arr = np.zeros((0, 3), dtype=np.float64)
@@ -977,6 +1176,7 @@ def filter_and_collect_points(
         points_eval_arr = np.vstack(points_eval)
 
     return points_gs_arr, points_eval_arr, reps_gs
+
 
 
 def compute_point_colors_from_observations(
