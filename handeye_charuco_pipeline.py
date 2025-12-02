@@ -588,8 +588,8 @@ def create_charuco_board():
     """
     squares_x = 7
     squares_y = 5
-    square_length_m = 32.0e-3  # 32 mm -> m
-    marker_length_m = 24.0e-3  # 24 mm -> m
+    square_length_m = 31.0e-3  # 32 mm -> m
+    marker_length_m = 23.0e-3  # 24 mm -> m
 
     dictionary = aruco.getPredefinedDictionary(aruco.DICT_4X4_50)
     board = aruco.CharucoBoard(
@@ -752,7 +752,7 @@ def calibrate_intrinsics(obj_points_all, img_points_all, image_size):
 
     rms, K, dist, rvecs, tvecs = cv2.calibrateCamera(
         obj_pts, img_pts, image_size, K, dist,
-        flags=cv2.CALIB_RATIONAL_MODEL
+        flags=cv2.CALIB_FIX_K6
     )
 
     print(f"[INFO] Calibration RMS reprojection error: {rms:.4f} px")
