@@ -1,6 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 """
 Known-pose SfM baseline:
 - Load camera poses from COLMAP images.txt
@@ -58,7 +55,7 @@ class BaselineConfig:
     # Matching
     sift_ratio: float = 0.8
     cross_check: bool = True
-    geom_max_error_px: float = 1.0   # ★ 4→3 に引き締め（エピポーラ誤差）
+    geom_max_error_px: float = 0.4   # ★ 4→3 に引き締め（エピポーラ誤差）
     geom_confidence: float = 0.999
     geom_min_inlier_ratio: float = 0.25
     geom_min_num_inliers: int = 10
