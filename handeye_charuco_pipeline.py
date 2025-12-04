@@ -749,10 +749,15 @@ def calibrate_intrinsics(obj_points_all, img_points_all, image_size):
 
     K = np.zeros((3, 3), dtype=np.float64)
     dist = np.zeros((5, 1), dtype=np.float64)
-
+    flags = (
+        cv2.CALIB_FIX_K1 |
+        cv2.CALIB_FIX_K2 |
+        cv2.CALIB_FIX_K3 |
+        cv2.CALIB_FIX_TANGENT_DIST
+    )
     rms, K, dist, rvecs, tvecs = cv2.calibrateCamera(
         obj_pts, img_pts, image_size, K, dist,
-        flags=cv2.CALIB_FIX_K6
+        flags=flags
     )
 
     print(f"[INFO] Calibration RMS reprojection error: {rms:.4f} px")
@@ -1461,6 +1466,10 @@ def main():
     # 以降の処理では BA 後の Hand-Eye を使用
     R_cam2gripper = R_cam2gripper_refined
     t_cam2gripper = t_cam2gripper_refined
+    
+    print('===After Bundle Adjustment===')
+    print('R_cam2gripper =\n', f"{R_cam2gripper}")
+    print("t_cam2gripper =\n", f'{t_cam2gripper}')
 
     # 4) カメラポーズ固定利用の Charuco 再構成
     id_to_Xb, T_b_c_list, used_image_paths = reconstruct_charuco_points_in_base(
