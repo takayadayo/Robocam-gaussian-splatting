@@ -1,6 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 """
 Known-pose SfM baseline:
 - Load camera poses from COLMAP images.txt
@@ -24,12 +21,14 @@ Usage example:
 
 import argparse
 import os
+import math
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import cv2
 import numpy as np
 from scipy.optimize import least_squares
+from scipy.sparse import lil_matrix
 from scipy.spatial import cKDTree
 import matplotlib.pyplot as plt
 
@@ -47,30 +46,30 @@ class BaselineConfig:
     use_domain_size_pooling: bool = False
 
     # Pair selection (pose-based)
-    theta_min_pair_deg: float = 3.0
-    theta_max_pair_deg: float = 45.0
-    baseline_over_depth_min: float = 0.02
-    baseline_over_depth_max: float = 0.5
+    theta_min_pair_deg: float = 6.0
+    theta_max_pair_deg: float = 65.0
+    baseline_over_depth_min: float = 0.05
+    baseline_over_depth_max: float = 0.6
     max_pairs_per_image: int = 10
     seq_neighbor_window: int = 3
 
     # Matching
-    sift_ratio: float = 0.75
+    sift_ratio: float = 0.8
     cross_check: bool = True
-    geom_max_error_px: float = 1.0   # ★ 4→3 に引き締め（エピポーラ誤差）
+    geom_max_error_px: float = 0.4   # ★ 4→3 に引き締め（エピポーラ誤差）
     geom_confidence: float = 0.999
     geom_min_inlier_ratio: float = 0.25
-    geom_min_num_inliers: int = 15
+    geom_min_num_inliers: int = 10
     guided_matching: bool = False
 
     # Triangulation & BA
-    tri_min_angle_deg: float = 3.0   # ★ 1.5→2.0deg（COLMAP推奨より少しだけ強め）
+    tri_min_angle_deg: float = 4.0   # ★ 1.5→2.0deg（COLMAP推奨より少しだけ強め）
     use_two_view_tracks_for_eval: bool = False
     use_two_view_tracks_for_gs: bool = True
     
     # Track quality classification
     strong_track_min_angle_deg: float = 10.0  # ≧この視差角 or 長さ≥4なら強トラック
-    weak_track_min_angle_deg: float = 3.0    # ≧この視差角なら弱トラック候補
+    weak_track_min_angle_deg: float = 4.0    # ≧この視差角なら弱トラック候補
 
     # BA loss / filtering (px → 後で正規化)
     ba_loss_scale_px: float = 1.0    # ★ ロバスト閾値もやや厳しく
@@ -81,15 +80,6 @@ class BaselineConfig:
     # BA iterations
     ba_max_nfev: int = 500
 
-    # ---------- Global bundle adjustment ----------
-    global_ba_enable: bool = True
-    global_ba_loss: str = "huber"   # "huber" or "linear"
-    global_ba_max_nfev: int = 100
-
-    # Pose prior strength (Hand-Eye + ロボットポーズをどれだけ信用するか)
-    # 単位に注意：rotはdeg、transはワールド座標系の距離単位（mなら0.002≈2mmなど）
-    global_ba_cam_prior_rot_deg: float = 0.2
-    global_ba_cam_prior_trans: float = 0.002
 
 
 # ============================================================
@@ -986,16 +976,15 @@ def filter_and_collect_points(
     tracks: List[List[Tuple[int, int]]],
     images: Dict[int, ImageInfo],
     config: BaselineConfig,
-) -> Tuple[np.ndarray, np.ndarray, List[Tuple[int, int]], np.ndarray, List[List[Tuple[int, int]]]]:
+) -> Tuple[np.ndarray, np.ndarray, List[Tuple[int, int]], List[List[Tuple[int, int]]]]:
     """
     Triangulate + iterative point-only BA + filtering.
 
     Returns:
-      points_gs:      3D points for 3DGS (track_len >= 2, after filtering)
-      points_eval:    3D points for evaluation (track_len >= 3, after filtering)
-      reps_gs:        list of (image_id, kp_idx) representing each 3DGS point
-      ba_points_init: (N,3) initial 3D points for global BA (3DGS pointsと1:1対応)
-      ba_tracks:      list of tracks (List[(image_id, kp_idx)]) for global BA
+      points_gs:  3D points for 3DGS (track_len >= 2, after filtering)
+      points_eval: 3D points for evaluation (track_len >= 3, after filtering)
+      reps_gs: representative observation (image_id, kp_idx) for each 3DGS point
+      tracks_gs: final multi-view track (list of (image_id, kp_idx)) per 3DGS point
     """
 
     if not tracks:
@@ -1065,10 +1054,7 @@ def filter_and_collect_points(
     points_gs: List[np.ndarray] = []
     points_eval: List[np.ndarray] = []
     reps_gs: List[Tuple[int, int]] = []
-
-    # Global BA 用：points_gs と同じ順序で対応するトラックを格納
-    ba_points: List[np.ndarray] = []
-    ba_tracks: List[List[Tuple[int, int]]] = []
+    tracks_gs: List[List[Tuple[int, int]]] = []
 
     def process_track_list(track_list: List[List[Tuple[int, int]]]) -> None:
         nonlocal points_gs, points_eval, reps_gs
@@ -1164,19 +1150,15 @@ def filter_and_collect_points(
             best_idx = int(np.argmin(errs_final))
             rep_obs = current_track[best_idx]  # (image_id, kp_idx)
 
-            # Global BA 用（3DGS点と1:1に対応させる）
-            ba_points.append(X_final)
-            ba_tracks.append(list(current_track))  # コピーしておく
-
             # 3DGS用 (>=2視点)
             if config.use_two_view_tracks_for_gs and len(current_track) >= 2:
                 points_gs.append(X_final)
                 reps_gs.append(rep_obs)
+                tracks_gs.append(list(current_track))
 
             # 評価用 (>=3視点)
             if (not config.use_two_view_tracks_for_eval) and len(current_track) >= 3:
                 points_eval.append(X_final)
-
 
     # まず強トラックを処理して骨格点群を得る
     process_track_list(strong_tracks)
@@ -1193,253 +1175,7 @@ def filter_and_collect_points(
     else:
         points_eval_arr = np.vstack(points_eval)
 
-    if len(ba_points) == 0:
-        ba_points_arr = np.zeros((0, 3), dtype=np.float64)
-    else:
-        ba_points_arr = np.vstack(ba_points)
-
-    return points_gs_arr, points_eval_arr, reps_gs, ba_points_arr, ba_tracks
-
-
-def run_global_bundle_adjustment(
-    images: Dict[int, ImageInfo],
-    ba_tracks: List[List[Tuple[int, int]]],
-    ba_points_init: np.ndarray,
-    config: BaselineConfig,
-) -> Tuple[np.ndarray, Dict[int, Tuple[float, float]]]:
-    """
-    Global bundle adjustment:
-      - 変数: 各カメラの (R,t) と各3D点 X
-      - 観測: keypoints_norm (正規化画像座標) の reprojection 誤差
-      - 事前: 初期 (R,t) との pose prior（回転・並進）
-
-    Args:
-        images: image_id -> ImageInfo (R_cw, t_cw, K, keypoints_norm 等を含む)
-        ba_tracks: 各3D点に対応する track ([(image_id, kp_idx), ...])
-        ba_points_init: (N,3) 各3D点の初期座標（filter_and_collect_points で得たもの）
-
-    Returns:
-        X_opt: (N,3) Global BA 後の3D点
-        pose_errors: image_id -> (rot_err_deg, trans_err_norm)
-    """
-    Np = ba_points_init.shape[0]
-    if Np == 0 or len(ba_tracks) == 0:
-        print("[Global BA] No points/tracks. Skipping global bundle adjustment.")
-        return ba_points_init, {}
-
-    # この BA に実際に現れるカメラだけを対象にする
-    used_cam_ids = sorted({img_id for track in ba_tracks for (img_id, _) in track})
-    Nc = len(used_cam_ids)
-    cam_index = {img_id: idx for idx, img_id in enumerate(used_cam_ids)}
-
-    # 平均焦点距離（px）→ 正規化座標の誤差を px に換算するため
-    some_info = images[used_cam_ids[0]]
-    fx = some_info.K[0, 0]
-    fy = some_info.K[1, 1]
-    f_mean = 0.5 * (fx + fy)
-
-    # --- カメラの初期パラメータ（Rodrigues回転 + 並進）と事前 ---
-    cam_rot_prior = np.zeros((Nc, 3), dtype=np.float64)
-    cam_t_prior = np.zeros((Nc, 3), dtype=np.float64)
-
-    for img_id, idx in cam_index.items():
-        info = images[img_id]
-        R = info.R_cw
-        t = info.t_cw.reshape(3)
-        rvec, _ = cv2.Rodrigues(R)
-        cam_rot_prior[idx] = rvec.reshape(3)
-        cam_t_prior[idx] = t
-
-    cam_params0 = np.hstack([cam_rot_prior, cam_t_prior]).reshape(-1)  # (Nc*6,)
-
-    # --- 観測のインデックスと2D点（正規化座標） ---
-    obs_cam_idx = []
-    obs_pt_idx = []
-    obs_xy = []
-    for p_idx, track in enumerate(ba_tracks):
-        for (img_id, kp_idx) in track:
-            if img_id not in cam_index:
-                continue
-            j = cam_index[img_id]
-            obs_cam_idx.append(j)
-            obs_pt_idx.append(p_idx)
-            obs_xy.append(images[img_id].keypoints_norm[kp_idx])
-
-    obs_cam_idx = np.asarray(obs_cam_idx, dtype=np.int32)
-    obs_pt_idx = np.asarray(obs_pt_idx, dtype=np.int32)
-    obs_xy = np.asarray(obs_xy, dtype=np.float64)
-    N_obs = obs_cam_idx.shape[0]
-
-    if N_obs == 0:
-        print("[Global BA] No observations. Skipping global bundle adjustment.")
-        return ba_points_init, {}
-
-    # --- パラメータベクトル x = [cam_params (Nc*6), X (Np*3)] ---
-    X0 = ba_points_init.reshape(-1)
-    x0 = np.concatenate([cam_params0, X0])
-
-    # --- pose prior のスケール ---
-    rot_sigma_rad = np.deg2rad(max(config.global_ba_cam_prior_rot_deg, 1e-6))
-    trans_sigma = max(config.global_ba_cam_prior_trans, 1e-9)
-
-    # --- Huber ロスのスケール（正規化座標系） ---
-    ba_f_scale_norm = config.ba_loss_scale_px / max(f_mean, 1e-6)
-
-    # --- 初期 RMS（px）を計算しておく（ログ用） ---
-    def compute_rms_px(cam_params_flat: np.ndarray, X_flat: np.ndarray) -> float:
-        cam_params = cam_params_flat.reshape(Nc, 6)
-        X = X_flat.reshape(Np, 3)
-        res_sq_sum = 0.0
-        cnt = 0
-
-        # 事前計算
-        R_list = []
-        t_list = []
-        for k in range(Nc):
-            rvec = cam_params[k, :3].reshape(3, 1)
-            R, _ = cv2.Rodrigues(rvec)
-            t = cam_params[k, 3:].reshape(3, 1)
-            R_list.append(R)
-            t_list.append(t)
-
-        for n in range(N_obs):
-            j = int(obs_cam_idx[n])
-            i = int(obs_pt_idx[n])
-            R = R_list[j]
-            t = t_list[j]
-            Xw = X[i].reshape(3, 1)
-            Xc = R @ Xw + t
-            z = float(Xc[2, 0])
-            if z <= 1e-8:
-                continue
-            xn = Xc[0, 0] / z
-            yn = Xc[1, 0] / z
-            dx = xn - obs_xy[n, 0]
-            dy = yn - obs_xy[n, 1]
-            res_sq_sum += dx * dx + dy * dy
-            cnt += 1
-
-        if cnt == 0:
-            return 0.0
-        rms_norm = np.sqrt(res_sq_sum / cnt)
-        return rms_norm * f_mean
-
-    init_rms_px = compute_rms_px(cam_params0, X0)
-    print(f"[Global BA] Initial reprojection RMS ≈ {init_rms_px:.3f} px (Nobs={N_obs}, Ncams={Nc}, Npoints={Np})")
-
-    # --- 残差ベクトル ---
-    def residuals(x: np.ndarray) -> np.ndarray:
-        cam_params = x[: Nc * 6].reshape(Nc, 6)
-        X = x[Nc * 6 :].reshape(Np, 3)
-
-        # カメラを事前計算
-        R_list = []
-        t_list = []
-        for k in range(Nc):
-            rvec = cam_params[k, :3].reshape(3, 1)
-            R, _ = cv2.Rodrigues(rvec)
-            t = cam_params[k, 3:].reshape(3, 1)
-            R_list.append(R)
-            t_list.append(t)
-
-        # 観測残差（正規化座標）
-        res_obs = np.empty((N_obs, 2), dtype=np.float64)
-        for n in range(N_obs):
-            j = int(obs_cam_idx[n])
-            i = int(obs_pt_idx[n])
-            R = R_list[j]
-            t = t_list[j]
-            Xw = X[i].reshape(3, 1)
-            Xc = R @ Xw + t
-            z = float(Xc[2, 0])
-            if z <= 1e-8:
-                res_obs[n, :] = 1e3  # 後方視点などは強くペナルティ
-            else:
-                xn = Xc[0, 0] / z
-                yn = Xc[1, 0] / z
-                res_obs[n, 0] = xn - obs_xy[n, 0]
-                res_obs[n, 1] = yn - obs_xy[n, 1]
-
-        res_obs_flat = res_obs.reshape(-1)
-
-        # pose prior 残差
-        res_prior_rot = np.zeros((Nc, 3), dtype=np.float64)
-        res_prior_t = np.zeros((Nc, 3), dtype=np.float64)
-
-        for k in range(Nc):
-            # 回転の相対誤差（R_opt * R_prior^T のRodriguesベクトル）
-            rvec_opt = cam_params[k, :3].reshape(3, 1)
-            R_opt, _ = cv2.Rodrigues(rvec_opt)
-            rvec_prior = cam_rot_prior[k].reshape(3, 1)
-            R_prior, _ = cv2.Rodrigues(rvec_prior)
-            R_rel = R_opt @ R_prior.T
-            r_rel, _ = cv2.Rodrigues(R_rel)
-            res_prior_rot[k, :] = (r_rel.reshape(3) / rot_sigma_rad)
-
-            # 並進の相対誤差
-            t_opt = cam_params[k, 3:].reshape(3)
-            dt = t_opt - cam_t_prior[k]
-            res_prior_t[k, :] = dt / trans_sigma
-
-        res_prior = np.concatenate([res_prior_rot.reshape(-1), res_prior_t.reshape(-1)])
-
-        return np.concatenate([res_obs_flat, res_prior])
-
-    result = least_squares(
-        residuals,
-        x0,
-        method="trf",
-        loss=config.global_ba_loss,
-        f_scale=ba_f_scale_norm,
-        max_nfev=config.global_ba_max_nfev,
-        verbose=0,
-    )
-
-    x_opt = result.x
-    cam_params_opt = x_opt[: Nc * 6].reshape(Nc, 6)
-    X_opt = x_opt[Nc * 6 :].reshape(Np, 3)
-
-    final_rms_px = compute_rms_px(cam_params_opt.reshape(-1), X_opt.reshape(-1))
-    print(f"[Global BA] Final reprojection RMS ≈ {final_rms_px:.3f} px")
-
-    # --- カメラポーズの更新と、初期値との差分 ---
-    pose_errors: Dict[int, Tuple[float, float]] = {}
-
-    for img_id, k in cam_index.items():
-        rvec_opt = cam_params_opt[k, :3].reshape(3, 1)
-        R_opt, _ = cv2.Rodrigues(rvec_opt)
-        t_opt = cam_params_opt[k, 3:].reshape(3, 1)
-
-        # 画像構造体をアップデート
-        images[img_id].R_cw = R_opt
-        images[img_id].t_cw = t_opt.reshape(3)
-        images[img_id].C = (-R_opt.T @ t_opt).reshape(3)
-
-        # 初期ポーズとの差
-        rvec_prior = cam_rot_prior[k].reshape(3, 1)
-        R_prior, _ = cv2.Rodrigues(rvec_prior)
-        t_prior = cam_t_prior[k].reshape(3, 1)
-
-        R_rel = R_opt @ R_prior.T
-        r_rel, _ = cv2.Rodrigues(R_rel)
-        rot_err_rad = float(np.linalg.norm(r_rel.reshape(3)))
-        rot_err_deg = np.degrees(rot_err_rad)
-
-        trans_err = float(np.linalg.norm(t_opt - t_prior))
-
-        pose_errors[img_id] = (rot_err_deg, trans_err)
-
-    # 簡単な統計も出力
-    if pose_errors:
-        rot_errs = np.array([v[0] for v in pose_errors.values()], dtype=np.float64)
-        trans_errs = np.array([v[1] for v in pose_errors.values()], dtype=np.float64)
-        print(
-            "[Global BA] Pose deltas: "
-            f"rot (deg) mean={rot_errs.mean():.4f}, median={np.median(rot_errs):.4f}, max={rot_errs.max():.4f}; "
-            f"trans (norm) mean={trans_errs.mean():.6f}, median={np.median(trans_errs):.6f}, max={trans_errs.max():.6f}"
-        )
-
-    return X_opt, pose_errors
+    return points_gs_arr, points_eval_arr, reps_gs, tracks_gs
 
 
 
@@ -1531,6 +1267,377 @@ def statistical_outlier_removal(
     mask = mean_dists <= thresh
     filtered_points = points[mask]
     return filtered_points, mask
+
+
+# ============================================================
+# Joint bundle adjustment (optimize poses + points)
+# ============================================================
+
+def rotmat_to_rodrigues(R: np.ndarray) -> np.ndarray:
+    rvec, _ = cv2.Rodrigues(R.astype(np.float64))
+    return rvec.reshape(3)
+
+
+def rodrigues_to_rotmat(rvec: np.ndarray) -> np.ndarray:
+    vec = rvec.astype(np.float64).reshape(3, 1)
+    R, _ = cv2.Rodrigues(vec)
+    return R
+
+
+def build_joint_ba_sparsity(
+    cam_indices: np.ndarray,
+    point_indices: np.ndarray,
+    num_cams_opt: int,
+    num_points: int,
+) -> lil_matrix:
+    """
+    Each residual depends on one camera (6 params) and one 3D point (3 params).
+    """
+    num_obs = cam_indices.shape[0]
+    rows = num_obs * 2
+    cols = num_cams_opt * 6 + num_points * 3
+    sparsity = lil_matrix((rows, cols), dtype=int)
+
+    for obs_idx in range(num_obs):
+        pt_idx = int(point_indices[obs_idx])
+        row0 = 2 * obs_idx
+        row1 = row0 + 1
+        col_p = num_cams_opt * 6 + pt_idx * 3
+        sparsity[row0, col_p : col_p + 3] = 1
+        sparsity[row1, col_p : col_p + 3] = 1
+
+        cam_idx = int(cam_indices[obs_idx])
+        if cam_idx >= 0:
+            col_c = cam_idx * 6
+            sparsity[row0, col_c : col_c + 6] = 1
+            sparsity[row1, col_c : col_c + 6] = 1
+
+    return sparsity
+
+
+def bundle_adjustment_points_and_poses(
+    points: np.ndarray,
+    tracks: List[List[Tuple[int, int]]],
+    images: Dict[int, ImageInfo],
+    config: BaselineConfig,
+) -> np.ndarray:
+    """
+    Optimize camera poses (extrinsics) and 3D points jointly.
+    All poses start from the known COLMAP poses to keep the global gauge.
+    The first participating camera is kept fixed to avoid gauge freedom.
+    """
+    num_points = points.shape[0]
+    if num_points == 0 or len(tracks) == 0:
+        return points
+
+    participating_ids = sorted({img_id for track in tracks for (img_id, _) in track})
+    if not participating_ids:
+        return points
+
+    ref_cam_id = participating_ids[0]
+    opt_cam_ids = [cid for cid in participating_ids if cid != ref_cam_id]
+    cam_id_to_opt = {cid: idx for idx, cid in enumerate(opt_cam_ids)}
+
+    obs_img_ids = []
+    obs_cam_indices = []
+    obs_point_indices = []
+    obs_measurements = []
+
+    for pt_idx, track in enumerate(tracks):
+        for (img_id, kp_idx) in track:
+            info = images.get(img_id)
+            if info is None or info.keypoints_norm is None:
+                continue
+            if kp_idx >= info.keypoints_norm.shape[0]:
+                continue
+            obs_img_ids.append(img_id)
+            obs_cam_indices.append(cam_id_to_opt.get(img_id, -1))
+            obs_point_indices.append(pt_idx)
+            obs_measurements.append(info.keypoints_norm[kp_idx])
+
+    num_obs = len(obs_img_ids)
+    if num_obs < 4:
+        print("Not enough observations for joint BA. Skipping pose refinement.")
+        return points
+
+    obs_img_ids = np.array(obs_img_ids, dtype=np.int32)
+    obs_cam_indices = np.array(obs_cam_indices, dtype=np.int32)
+    obs_point_indices = np.array(obs_point_indices, dtype=np.int32)
+    obs_measurements = np.array(obs_measurements, dtype=np.float64)
+
+    num_cams_opt = len(opt_cam_ids)
+
+    camera_params0 = np.zeros((num_cams_opt, 6), dtype=np.float64)
+    for idx, cam_id in enumerate(opt_cam_ids):
+        info = images[cam_id]
+        camera_params0[idx, :3] = rotmat_to_rodrigues(info.R_cw)
+        camera_params0[idx, 3:] = info.t_cw.astype(np.float64)
+
+    points0 = points.astype(np.float64).copy()
+
+    x0 = np.hstack([camera_params0.ravel(), points0.ravel()])
+
+    sparsity = build_joint_ba_sparsity(
+        obs_cam_indices,
+        obs_point_indices,
+        num_cams_opt,
+        num_points,
+    )
+
+    ref_R = images[ref_cam_id].R_cw.copy()
+    ref_t = images[ref_cam_id].t_cw.astype(np.float64).copy()
+
+    f_mean = 0.0
+    first_info = next(iter(images.values()))
+    fx = float(first_info.K[0, 0])
+    fy = float(first_info.K[1, 1])
+    f_mean = 0.5 * (fx + fy)
+    f_scale_norm = config.ba_loss_scale_px / max(f_mean, 1e-6)
+
+    def residuals(param_vec: np.ndarray) -> np.ndarray:
+        camera_params = (
+            param_vec[: num_cams_opt * 6].reshape(num_cams_opt, 6)
+            if num_cams_opt > 0
+            else np.zeros((0, 6), dtype=np.float64)
+        )
+        points_3d = param_vec[num_cams_opt * 6 :].reshape(num_points, 3)
+        res = np.zeros(num_obs * 2, dtype=np.float64)
+
+        for obs_idx in range(num_obs):
+            pt_idx = obs_point_indices[obs_idx]
+            cam_idx = obs_cam_indices[obs_idx]
+            img_id = obs_img_ids[obs_idx]
+            obs = obs_measurements[obs_idx]
+
+            if cam_idx < 0:
+                R = ref_R
+                t = ref_t
+            else:
+                rvec = camera_params[cam_idx, :3]
+                tvec = camera_params[cam_idx, 3:]
+                R = rodrigues_to_rotmat(rvec)
+                t = tvec
+
+            X = points_3d[pt_idx].reshape(3, 1)
+            X_cam = R @ X + t.reshape(3, 1)
+            z = float(X_cam[2, 0])
+            if z <= 1e-8:
+                res[2 * obs_idx : 2 * obs_idx + 2] = 1e3
+                continue
+            xn = X_cam[0, 0] / z
+            yn = X_cam[1, 0] / z
+            res[2 * obs_idx] = xn - obs[0]
+            res[2 * obs_idx + 1] = yn - obs[1]
+
+        return res
+
+    print(
+        f"Running joint bundle adjustment on {num_points} points "
+        f"and {len(participating_ids)} cameras (ref={ref_cam_id})."
+    )
+    result = least_squares(
+        residuals,
+        x0,
+        jac_sparsity=sparsity,
+        loss="huber",
+        f_scale=f_scale_norm,
+        max_nfev=config.ba_max_nfev,
+        verbose=1,
+    )
+    print(f"Joint BA finished. success={result.success}, cost={result.cost:.3e}")
+
+    params_opt = result.x
+    if num_cams_opt > 0:
+        camera_params_opt = params_opt[: num_cams_opt * 6].reshape(num_cams_opt, 6)
+    else:
+        camera_params_opt = np.zeros((0, 6), dtype=np.float64)
+    points_opt = params_opt[num_cams_opt * 6 :].reshape(num_points, 3)
+
+    # Update poses (non-reference cameras)
+    for idx, cam_id in enumerate(opt_cam_ids):
+        info = images[cam_id]
+        rvec = camera_params_opt[idx, :3]
+        tvec = camera_params_opt[idx, 3:]
+        R_new = rodrigues_to_rotmat(rvec)
+        t_new = tvec.astype(np.float64)
+        info.R_cw = R_new
+        info.t_cw = t_new
+        info.C = -R_new.T @ t_new.reshape(3, 1)
+        info.C = info.C.ravel()
+
+    # Reference camera stays unchanged but ensure C is up to date
+    ref_info = images[ref_cam_id]
+    ref_info.C = -ref_info.R_cw.T @ ref_info.t_cw.reshape(3, 1)
+    ref_info.C = ref_info.C.ravel()
+
+    points[:, :] = points_opt
+    return points
+
+
+def compute_reproj_errors_px_point(
+    Xw: np.ndarray,
+    track: List[Tuple[int, int]],
+    images: Dict[int, ImageInfo],
+) -> Tuple[float, np.ndarray]:
+    """
+    単一3D点 Xw とそのトラックに対する再投影誤差 [px] を計算する。
+
+    Returns:
+        rms_error_px: 各観測誤差の RMS (root-mean-square) [px]
+        errs_px: 各観測ごとの誤差ノルム [px] の配列 shape (M,)
+    """
+    if Xw.ndim == 1:
+        X = Xw.reshape(1, 1, 3).astype(np.float64)
+    else:
+        X = Xw.reshape(1, 1, 3).astype(np.float64)
+
+    errs = []
+    for (img_id, kp_idx) in track:
+        info = images[img_id]
+        # R_cw (world→cam) を Rodrigues へ
+        rvec, _ = cv2.Rodrigues(info.R_cw.astype(np.float64))
+        tvec = info.t_cw.reshape(3, 1).astype(np.float64)
+
+        proj, _ = cv2.projectPoints(
+            X, rvec, tvec, info.K.astype(np.float64), info.dist.astype(np.float64)
+        )
+        u, v = proj[0, 0]
+        obs = info.keypoints_px[kp_idx]
+        du = float(u - obs[0])
+        dv = float(v - obs[1])
+        errs.append(math.hypot(du, dv))
+
+    if len(errs) == 0:
+        return 0.0, np.zeros((0,), dtype=np.float64)
+
+    errs_px = np.array(errs, dtype=np.float64)
+    rms = float(np.sqrt(np.mean(errs_px ** 2)))
+    return rms, errs_px
+
+
+def compute_reproj_errors_px_for_all(
+    points: np.ndarray,
+    tracks: List[List[Tuple[int, int]]],
+    images: Dict[int, ImageInfo],
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    全3D点について RMS 誤差と全観測誤差を計算。
+
+    Returns:
+        per_point_rms: shape (N,) 各点の RMS reprojection error [px]
+        all_obs_errs:  shape (M_total,) 全観測の誤差ノルム [px] を連結したもの
+    """
+    N = points.shape[0]
+    per_point_rms = []
+    all_errs_list = []
+
+    for Xw, track in zip(points, tracks):
+        rms, errs = compute_reproj_errors_px_point(Xw, track, images)
+        per_point_rms.append(rms)
+        if errs.size > 0:
+            all_errs_list.append(errs)
+
+    if N == 0:
+        return np.zeros((0,), dtype=np.float64), np.zeros((0,), dtype=np.float64)
+
+    per_point_rms = np.array(per_point_rms, dtype=np.float64)
+
+    if len(all_errs_list) > 0:
+        all_obs_errs = np.concatenate(all_errs_list, axis=0)
+    else:
+        all_obs_errs = np.zeros((0,), dtype=np.float64)
+
+    return per_point_rms, all_obs_errs
+
+
+def report_reprojection_error_stats(all_obs_errs: np.ndarray) -> None:
+    """
+    全観測の再投影誤差 [px] から、代表値をログ出力。
+    """
+    if all_obs_errs.size == 0:
+        print("No reprojection errors to report.")
+        return
+
+    mean_err = float(all_obs_errs.mean())
+    median_err = float(np.median(all_obs_errs))
+    max_err = float(all_obs_errs.max())
+
+    print(
+        f"Reprojection error over all observations (px): "
+        f"mean={mean_err:.3f}, median={median_err:.3f}, max={max_err:.3f}"
+    )
+
+
+def write_points3D_txt(
+    points: np.ndarray,
+    tracks: List[List[Tuple[int, int]]],
+    colors: Optional[np.ndarray],
+    per_point_rms: Optional[np.ndarray],
+    path: str,
+) -> None:
+    """
+    COLMAP の points3D.txt 形式で3D点群を書き出す。
+
+    - POINT3D_ID は 1..N の連番とする
+    - R,G,B は 0–255 の uchar
+    - ERROR は各点の RMS 再投影誤差 [px]
+    - TRACK は (IMAGE_ID, POINT2D_IDX) のペア列
+
+    注意:
+      POINT2D_IDX は、このパイプライン内の keypoints 配列の index として扱う。
+      既存の COLMAP images.txt / points2D.txt と完全互換にしたい場合は、
+      2D点のインデックスとの対応付けが必要になる。
+    """
+    N = points.shape[0]
+    assert N == len(tracks)
+
+    if colors is None or colors.shape[0] != N:
+        colors = np.full((N, 3), 255, dtype=np.uint8)
+
+    if per_point_rms is None or per_point_rms.shape[0] != N:
+        per_point_rms = np.zeros((N,), dtype=np.float64)
+
+    if N == 0:
+        mean_track_len = 0.0
+    else:
+        mean_track_len = float(sum(len(tr) for tr in tracks) / N)
+
+    with open(path, "w") as f:
+        f.write("# 3D point list with one line of data per point:\n")
+        f.write("# POINT3D_ID, X, Y, Z, R, G, B, ERROR, TRACK[] as (IMAGE_ID, POINT2D_IDX)\n")
+        f.write(f"# Number of points: {N}, mean track length: {mean_track_len}\n")
+
+        for idx in range(N):
+            point3D_id = idx + 1
+            X = points[idx]
+            c = colors[idx]
+            err = float(per_point_rms[idx])
+
+            header_vals = [
+                point3D_id,
+                X[0],
+                X[1],
+                X[2],
+                int(c[0]),
+                int(c[1]),
+                int(c[2]),
+                err,
+            ]
+            f.write(" ".join(str(v) for v in header_vals))
+
+            tr = tracks[idx]
+            if tr:
+                f.write(" ")
+                track_tokens = []
+                for (img_id, kp_idx) in tr:
+                    track_tokens.append(str(img_id))
+                    track_tokens.append(str(kp_idx))
+                f.write(" ".join(track_tokens))
+
+            f.write("\n")
+
+    print(f"Wrote COLMAP points3D.txt: {path} (N={N})")
+
 
 
 # ============================================================
@@ -1649,6 +1756,14 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional: path to output PLY file for 3DGS point cloud",
     )
+
+    parser.add_argument(
+        "--output_points3d",
+        type=str,
+        default="points3D.txt",
+        help="Path to write COLMAP-style points3D.txt (3D points, colors, tracks, and reprojection error).",
+    )
+
     parser.add_argument(
         "--no_show",
         action="store_true",
@@ -1700,50 +1815,39 @@ def main():
         return
 
     # 7) Triangulation + point-only BA + filtering
-    print("Triangulating and refining points with fixed known poses (per-track BA)...")
-    points_gs_init, points_eval, reps_gs, ba_points_init, ba_tracks = filter_and_collect_points(
-        tracks, images, config
-    )
-    print(f"Points for 3DGS before global BA: {points_gs_init.shape[0]}")
+    print("Triangulating and refining points with fixed known poses...")
+    points_gs, points_eval, reps_gs, tracks_gs = filter_and_collect_points(tracks, images, config)
+    print(f"Raw points for 3DGS (before 3D outlier removal): {points_gs.shape[0]}")
+    print(f"Points for evaluation (>=3 views): {points_eval.shape[0]}")
 
-
-    # 7.5) 3Dレベルでの Statistical Outlier Removal
-    # 7.5) Global bundle adjustment (camera poses + 3D points)
-    if config.global_ba_enable and ba_points_init.shape[0] > 0:
-        print("Running global bundle adjustment (camera poses + 3D points with pose priors)...")
-        points_gs_ba, pose_errors = run_global_bundle_adjustment(
-            images,
-            ba_tracks,
-            ba_points_init,
-            config,
-        )
-    else:
-        points_gs_ba = points_gs_init
-        pose_errors = {}
-
-    # 以下の処理（3Dフィルタリング、カラーサンプリング、PLY出力、可視化など）は
-    # すべて points_gs_ba を入力とする
-
-    
-    # 3Dフィルタリングの入力を Global BA 後の点群にする
-    raw_points_for_gs = points_gs_ba
-
-    if raw_points_for_gs.shape[0] > 0:
+    # 7.5) 3Dレベルでの Statistical Outlier Removal（従来実装そのまま）
+    if points_gs.shape[0] > 0:
         print("Applying 3D Statistical Outlier Removal to 3DGS points...")
         points_gs_filtered, mask = statistical_outlier_removal(
-            raw_points_for_gs,
+            points_gs,
             k_neighbors=20,
             std_ratio=2.0,
         )
         print(
             f"3DGS points after SOR: {points_gs_filtered.shape[0]} "
-            f"(removed {raw_points_for_gs.shape[0] - points_gs_filtered.shape[0]})"
+            f"(removed {points_gs.shape[0] - points_gs_filtered.shape[0]})"
         )
-        reps_gs_filtered = [r for r, m in zip(reps_gs, mask) if m]
-    else:
-        points_gs_filtered = raw_points_for_gs
-        reps_gs_filtered = reps_gs
 
+        reps_gs_filtered = [r for r, m in zip(reps_gs, mask) if m]
+        tracks_gs_filtered = [tr for tr, m in zip(tracks_gs, mask) if m]  # ★ track も同様にフィルタ
+    else:
+        points_gs_filtered = points_gs
+        reps_gs_filtered = reps_gs
+        tracks_gs_filtered = tracks_gs
+
+    # 7.75) Joint bundle adjustment (poses + points)
+    if points_gs_filtered.shape[0] > 0 and len(tracks_gs_filtered) > 0:
+        points_gs_filtered = bundle_adjustment_points_and_poses(
+            points_gs_filtered,
+            tracks_gs_filtered,
+            images,
+            config,
+        )
 
     # 8) Output PLY (for 3DGS) with colors
     colors_gs = None
@@ -1758,7 +1862,31 @@ def main():
     if args.output_ply is not None:
         write_points_to_ply(points_gs_filtered, args.output_ply, colors=colors_gs)
 
-    # 9) Visualization
+    # 8.5) 再投影誤差 (px) の算出と統計
+    if points_gs_filtered.shape[0] > 0:
+        print("Computing reprojection errors (px) for reconstructed points...")
+        per_point_rms_px, all_obs_errs_px = compute_reproj_errors_px_for_all(
+            points_gs_filtered,
+            tracks_gs_filtered,
+            images,
+        )
+        report_reprojection_error_stats(all_obs_errs_px)
+    else:
+        per_point_rms_px = np.zeros((0,), dtype=np.float64)
+        print("No points for reprojection error computation.")
+
+
+    # 9) Write COLMAP-style points3D.txt
+    if args.output_points3d is not None and points_gs_filtered.shape[0] > 0:
+        write_points3D_txt(
+            points_gs_filtered,
+            tracks_gs_filtered,
+            colors_gs,
+            per_point_rms_px,
+            args.output_points3d,
+        )
+
+    # 10) Visualization
     if not args.no_show:
         visualize_reconstruction(
             images,
@@ -1766,6 +1894,7 @@ def main():
             title="Known-pose sparse reconstruction (3DGS initialization, filtered)",
             save_path="reconstruction.png",
         )
+
 
 
 if __name__ == "__main__":
