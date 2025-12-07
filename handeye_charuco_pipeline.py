@@ -749,12 +749,7 @@ def calibrate_intrinsics(obj_points_all, img_points_all, image_size):
 
     K = np.zeros((3, 3), dtype=np.float64)
     dist = np.zeros((5, 1), dtype=np.float64)
-    flags = (
-        cv2.CALIB_FIX_K1 |
-        cv2.CALIB_FIX_K2 |
-        cv2.CALIB_FIX_K3 |
-        cv2.CALIB_FIX_TANGENT_DIST
-    )
+    flags = 0
     rms, K, dist, rvecs, tvecs = cv2.calibrateCamera(
         obj_pts, img_pts, image_size, K, dist,
         flags=flags
@@ -1458,7 +1453,7 @@ def main():
         rvecs=rvecs,
         tvecs=tvecs,
         euler_order="XYZ",
-        max_iters=20,
+        max_iters=10,
         lambda_init=1e-3,
         verbose=True,
     )

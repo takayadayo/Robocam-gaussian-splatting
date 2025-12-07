@@ -22,6 +22,7 @@ Usage example:
 import argparse
 import os
 import math
+import copy
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Optional
 
@@ -30,6 +31,7 @@ import numpy as np
 from scipy.optimize import least_squares
 from scipy.sparse import lil_matrix
 from scipy.spatial import cKDTree
+from scipy.spatial.transform import Rotation
 import matplotlib.pyplot as plt
 
 
@@ -54,7 +56,7 @@ class BaselineConfig:
     seq_neighbor_window: int = 3
 
     # Matching
-    sift_ratio: float = 0.8
+    sift_ratio: float = 0.7
     cross_check: bool = True
     geom_max_error_px: float = 0.4   # ★ 4→3 に引き締め（エピポーラ誤差）
     geom_confidence: float = 0.999
@@ -63,13 +65,13 @@ class BaselineConfig:
     guided_matching: bool = False
 
     # Triangulation & BA
-    tri_min_angle_deg: float = 4.0   # ★ 1.5→2.0deg（COLMAP推奨より少しだけ強め）
+    tri_min_angle_deg: float = 6.0   # ★ 1.5→2.0deg（COLMAP推奨より少しだけ強め）
     use_two_view_tracks_for_eval: bool = False
     use_two_view_tracks_for_gs: bool = True
     
     # Track quality classification
-    strong_track_min_angle_deg: float = 10.0  # ≧この視差角 or 長さ≥4なら強トラック
-    weak_track_min_angle_deg: float = 4.0    # ≧この視差角なら弱トラック候補
+    strong_track_min_angle_deg: float = 20.0  # ≧この視差角 or 長さ≥4なら強トラック
+    weak_track_min_angle_deg: float = 6.0    # ≧この視差角なら弱トラック候補
 
     # BA loss / filtering (px → 後で正規化)
     ba_loss_scale_px: float = 1.0    # ★ ロバスト閾値もやや厳しく
@@ -80,7 +82,18 @@ class BaselineConfig:
     # BA iterations
     ba_max_nfev: int = 500
 
-
+    # Joint BA with Priors settings
+    # カメラの回転・並進が初期値から動くことに対するペナルティ重み
+    # 値が大きいほど「既知ポーズ」を強く信じる。小さいほど画像合わせを優先する。
+    # 目安: 1.0e-2 〜 1.0e2 程度。
+    # 3DGS用なら「ポーズはかなり正確」前提なので、少し強めにかけてドリフトを防ぐ。
+    ba_pose_weight_rot: float = 1.0e-1    # 回転に対する重み
+    ba_pose_weight_trans: float = 1.0e-1  # 並進に対する重み
+    
+    # ポーズ最適化に参加させるトラックの条件
+    # すべての点を使うと計算が重く、かつ低品質な点がポーズを汚染するため
+    ba_opt_min_track_len: int = 3        # 3視点以上で見えている点のみポーズ最適化に使う
+    ba_opt_min_angle_deg: float = 6.0    # または、視差角がこれ以上ある場合
 
 # ============================================================
 # Data structures
@@ -119,6 +132,72 @@ def qvec2rotmat(qvec: np.ndarray) -> np.ndarray:
     ], dtype=np.float64)
     return R
 
+def rotmat2qvec(R: np.ndarray) -> np.ndarray:
+    """
+    Rotation matrix (3x3) to Quaternion (w, x, y, z) for COLMAP.
+    """
+    # scipy is (x, y, z, w)
+    quat = Rotation.from_matrix(R).as_quat()
+    # Convert to COLMAP convention (w, x, y, z)
+    return np.array([quat[3], quat[0], quat[1], quat[2]])
+
+def compute_rotation_diff_deg(R1: np.ndarray, R2: np.ndarray) -> float:
+    """
+    R1とR2の間の回転角（degree）を計算
+    """
+    # R_diff = R2 * R1.T
+    R_diff = R2 @ R1.T
+    # trace = 1 + 2 cos(theta)
+    tr = np.trace(R_diff)
+    cos_theta = (tr - 1.0) / 2.0
+    cos_theta = np.clip(cos_theta, -1.0, 1.0)
+    return np.degrees(np.arccos(cos_theta))
+
+def report_pose_changes(
+    images_init: Dict[int, ImageInfo],
+    images_opt: Dict[int, ImageInfo]
+) -> None:
+    """
+    最適化前後のカメラポーズの変化量を計算して表示する
+    """
+    trans_diffs = []
+    rot_diffs = []
+
+    for img_id, info_opt in images_opt.items():
+        if img_id not in images_init:
+            continue
+        info_init = images_init[img_id]
+
+        # Translation diff (L2 norm)
+        dt = np.linalg.norm(info_opt.t_cw - info_init.t_cw)
+        trans_diffs.append(dt)
+
+        # Rotation diff (Geodesic angle)
+        dr = compute_rotation_diff_deg(info_init.R_cw, info_opt.R_cw)
+        rot_diffs.append(dr)
+
+    if not trans_diffs:
+        print("No cameras to compare.")
+        return
+
+    trans_diffs = np.array(trans_diffs)
+    rot_diffs = np.array(rot_diffs)
+
+    print("\n" + "="*60)
+    print("  Camera Pose Changes (Optimization Result)")
+    print("="*60)
+    print(f"Translation Change (World Units):")
+    print(f"  Mean:   {trans_diffs.mean():.6f}")
+    print(f"  Median: {np.median(trans_diffs):.6f}")
+    print(f"  Max:    {trans_diffs.max():.6f}")
+    print(f"  Min:    {trans_diffs.min():.6f}")
+    print("-" * 40)
+    print(f"Rotation Change (Degrees):")
+    print(f"  Mean:   {rot_diffs.mean():.6f} deg")
+    print(f"  Median: {np.median(rot_diffs):.6f} deg")
+    print(f"  Max:    {rot_diffs.max():.6f} deg")
+    print(f"  Min:    {rot_diffs.min():.6f} deg")
+    print("="*60 + "\n")
 
 # ============================================================
 # Load intrinsics from YAML (K, dist)
@@ -831,6 +910,75 @@ def triangulate_track_linear(
     X = X_h[0:3] / X_h[3]
     return X
 
+def triangulate_optimal_pair(
+    track: List[Tuple[int, int]],
+    images: Dict[int, ImageInfo],
+    min_angle_deg: float
+) -> Optional[np.ndarray]:
+    """
+    COLMAP方式: トラック内の全ペアを探索し、
+    「視差角が最大かつ十分大きいペア」を用いて三角測量を行う。
+    全視点を混ぜるDLTよりも、デプス方向の初期値精度が高くなる。
+    """
+    best_angle = -1.0
+    best_X = None
+    
+    # トラック内の全ペアを総当り (Nが小さいので高速)
+    # Nが大きい場合は、時間的に離れたペアだけ見るなどの枝刈りも可能だが、
+    # ここでは厳密さを優先して全探索する。
+    n = len(track)
+    for i in range(n):
+        img_i, kp_i = track[i]
+        Ci = images[img_i].C
+        
+        for j in range(i + 1, n):
+            img_j, kp_j = track[j]
+            Cj = images[img_j].C
+            
+            # 視差角の計算 (Center-to-Center ベースの簡易版ではなく、レイ同士の角度を見るべきだが
+            # ここでは計算コストとロバスト性の兼ね合いでベースライン方向を見る)
+            baseline = np.linalg.norm(Ci - Cj)
+            if baseline < 1e-6:
+                continue
+
+            # 2視点での三角測量 (DLT for 2 views)
+            # ペア単位で解く
+            subset = [track[i], track[j]]
+            X_pair = triangulate_track_linear(subset, images) # 既存のDLT関数を再利用
+            
+            if X_pair is None:
+                continue
+                
+            # 視差角の厳密な評価: 生成された点 X_pair に対する角度
+            v_i = Ci - X_pair
+            v_j = Cj - X_pair
+            n_i = np.linalg.norm(v_i)
+            n_j = np.linalg.norm(v_j)
+            
+            if n_i < 1e-6 or n_j < 1e-6:
+                continue
+                
+            cos_th = np.dot(v_i / n_i, v_j / n_j)
+            angle_deg = np.degrees(np.arccos(np.clip(cos_th, -1.0, 1.0)))
+            
+            # チラリティチェック (カメラの前にあるか)
+            # 両方のカメラ座標系で Z > 0 であること
+            info_i = images[img_i]
+            X_cam_i = info_i.R_cw @ X_pair.reshape(3,1) + info_i.t_cw.reshape(3,1)
+            
+            info_j = images[img_j]
+            X_cam_j = info_j.R_cw @ X_pair.reshape(3,1) + info_j.t_cw.reshape(3,1)
+            
+            if X_cam_i[2,0] > 0 and X_cam_j[2,0] > 0:
+                if angle_deg > best_angle:
+                    best_angle = angle_deg
+                    best_X = X_pair
+
+    # 最大視差角が閾値未満なら、このトラックは信頼できないので破棄
+    if best_X is not None and best_angle >= min_angle_deg:
+        return best_X
+    
+    return None
 
 def compute_reproj_errors_norm(
     X: np.ndarray,
@@ -972,210 +1120,65 @@ def refine_point_ba(
 
 
 
-def filter_and_collect_points(
+def collect_points_for_joint_ba(
     tracks: List[List[Tuple[int, int]]],
     images: Dict[int, ImageInfo],
     config: BaselineConfig,
-) -> Tuple[np.ndarray, np.ndarray, List[Tuple[int, int]], List[List[Tuple[int, int]]]]:
-    """
-    Triangulate + iterative point-only BA + filtering.
+) -> Tuple[np.ndarray, List[List[Tuple[int, int]]], np.ndarray]:
+    
+    points_init = []
+    tracks_kept = []
+    mask_strong = []
 
-    Returns:
-      points_gs:  3D points for 3DGS (track_len >= 2, after filtering)
-      points_eval: 3D points for evaluation (track_len >= 3, after filtering)
-      reps_gs: representative observation (image_id, kp_idx) for each 3DGS point
-      tracks_gs: final multi-view track (list of (image_id, kp_idx)) per 3DGS point
-    """
+    # COLMAP推奨値に近い厳し目の角度閾値
+    # これ未満の点はデプス推定が数倍〜数十倍の誤差を持つため捨てる
+    strict_min_angle = max(config.tri_min_angle_deg, 2.0) 
 
-    if not tracks:
-        return (
-            np.zeros((0, 3), dtype=np.float64),
-            np.zeros((0, 3), dtype=np.float64),
-            [],
-        )
-
-    # 平均焦点距離
-    some_info = next(iter(images.values()))
-    fx = some_info.K[0, 0]
-    fy = some_info.K[1, 1]
-    f_mean = 0.5 * (fx + fy)
-
-    # pxベースの閾値を正規化座標系へ
-    base_mean_thresh_norm = config.point_mean_reproj_max_px / max(f_mean, 1e-6)
-    base_max_thresh_norm = config.point_max_reproj_max_px / max(f_mean, 1e-6)
-    obs_drop_thresh_norm = config.obs_drop_thresh_px / max(f_mean, 1e-6)
-
-    # シーン中心で擬似的な視差角を計算し、トラックを強／弱に分類
-    scene_center = compute_scene_center(images)
-    strong_tracks: List[List[Tuple[int, int]]] = []
-    weak_tracks: List[List[Tuple[int, int]]] = []
+    print(f"Triangulating with Best-Pair selection (Threshold: {strict_min_angle} deg)...")
 
     for track in tracks:
         if len(track) < 2:
             continue
-
-        # track に含まれる画像の視線方向（カメラ中心→scene_center）から近似三角測量角を計算
-        min_angle_deg = 180.0
-        n = len(track)
-        dirs = []
+        
+        # ★ 変更点: 全点DLTではなく、ベストペア探索を行う
+        X = triangulate_optimal_pair(track, images, min_angle_deg=strict_min_angle)
+        
+        if X is None:
+            continue
+            
+        # 以降の処理（Strong/Weak判定）は同じ
+        # ただし、ベストペアで閾値を超えている時点で、ある程度Strongであることは保証されている
+        
+        # 念のため全トラック視点での最大角を再計算して Strong フラグを立てる
+        angles = []
+        track_dirs = []
         for img_id, _ in track:
             Ci = images[img_id].C
-            v = scene_center - Ci
-            nv = np.linalg.norm(v)
-            if nv < 1e-8:
-                continue
-            dirs.append(v / nv)
-        if len(dirs) < 2:
-            # 視差角評価不可 → 弱トラック扱い
-            weak_tracks.append(track)
-            continue
+            v = X - Ci
+            vn = np.linalg.norm(v)
+            if vn > 1e-8:
+                track_dirs.append(v / vn)
+        
+        max_angle = 0.0
+        if len(track_dirs) >= 2:
+            for i in range(len(track_dirs)):
+                for j in range(i+1, len(track_dirs)):
+                    cos_th = np.dot(track_dirs[i], track_dirs[j])
+                    ang = np.degrees(np.arccos(np.clip(cos_th, -1.0, 1.0)))
+                    max_angle = max(max_angle, ang)
+        
+        # ポーズ最適化に使うのは、さらに角度がある信頼できる点のみ (例: 5度以上)
+        # 2度〜5度の点は、点として残すがポーズ計算には使わない、といった運用も可能
+        is_strong = (max_angle >= config.ba_opt_min_angle_deg)
 
-        for i in range(len(dirs)):
-            for j in range(i + 1, len(dirs)):
-                cos_th = float(np.clip(np.dot(dirs[i], dirs[j]), -1.0, 1.0))
-                ang = np.degrees(np.arccos(cos_th))
-                if ang < min_angle_deg:
-                    min_angle_deg = ang
-        if min_angle_deg == 180.0:
-            min_angle_deg = 0.0
+        points_init.append(X)
+        tracks_kept.append(track)
+        mask_strong.append(is_strong)
 
-        # 分類ロジック：
-        # - 視差角が十分大きい (>= strong_track_min_angle_deg) または track長>=4 → 強
-        # - 視差角が弱閾値以上 → 弱
-        # - それ未満 → 処理対象外（幾何的にあまり意味がない）
-        if min_angle_deg >= config.strong_track_min_angle_deg or len(track) >= 4:
-            strong_tracks.append(track)
-        elif min_angle_deg >= config.weak_track_min_angle_deg:
-            weak_tracks.append(track)
-        else:
-            # 非常に小さな視差角しかないトラックはスキップ
-            continue
+    if not points_init:
+        return np.zeros((0,3)), [], np.zeros((0,), dtype=bool)
 
-    points_gs: List[np.ndarray] = []
-    points_eval: List[np.ndarray] = []
-    reps_gs: List[Tuple[int, int]] = []
-    tracks_gs: List[List[Tuple[int, int]]] = []
-
-    def process_track_list(track_list: List[List[Tuple[int, int]]]) -> None:
-        nonlocal points_gs, points_eval, reps_gs
-
-        for track in track_list:
-            if len(track) < 2:
-                continue
-
-            # ---- 最大2回の (線形三角測量 → 点のみBA → 観測除外) 反復 ----
-            current_track = list(track)
-            X_ref = None
-            success = False
-
-            for _iter in range(2):
-                # (a) 線形三角測量
-                X0 = triangulate_track_linear(current_track, images)
-                if X0 is None:
-                    success = False
-                    break
-
-                # (b) 点のみBA（角度依存の Huber スケール）
-                X_ref = refine_point_ba(X0, current_track, images, config, f_mean)
-
-                # (c) 再投影誤差で高誤差観測を除外
-                res = compute_reproj_errors_norm(X_ref, current_track, images)  # (M,2)
-                errs = np.linalg.norm(res, axis=1)
-
-                good_idx = np.where(errs <= obs_drop_thresh_norm)[0]
-                if len(good_idx) < 2:
-                    success = False
-                    break
-
-                new_track = [current_track[k] for k in good_idx]
-
-                # 観測が変化しなくなれば収束
-                if len(new_track) == len(current_track):
-                    success = True
-                    current_track = new_track
-                    break
-                else:
-                    current_track = new_track
-
-            if not success or X_ref is None:
-                continue
-
-            # ---- 最終観測集合での誤差・角度評価 ----
-            res_final = compute_reproj_errors_norm(X_ref, current_track, images)
-            errs_final = np.linalg.norm(res_final, axis=1)
-
-            mean_err = float(errs_final.mean())
-            max_err = float(errs_final.max())
-
-            # 実三角測量角（deg）を計算
-            Xw = X_ref.reshape(3, 1)
-            min_angle_deg = compute_min_triangulation_angle_deg(current_track, images, Xw)
-
-            # tri_min_angle_deg 未満なら不採用
-            if min_angle_deg < config.tri_min_angle_deg:
-                continue
-
-            # 角度に応じて reprojection 閾値をスケーリング
-            tri_min = config.tri_min_angle_deg
-            tri_strong = max(config.strong_track_min_angle_deg, tri_min + 1e-3)
-            if min_angle_deg <= tri_min:
-                angle_scale = 0.5
-            elif min_angle_deg >= tri_strong:
-                angle_scale = 1.0
-            else:
-                t = (min_angle_deg - tri_min) / (tri_strong - tri_min)
-                angle_scale = 0.5 + 0.5 * t
-
-            mean_thresh_norm = base_mean_thresh_norm * angle_scale
-            max_thresh_norm = base_max_thresh_norm * angle_scale
-
-            if mean_err > mean_thresh_norm or max_err > max_thresh_norm:
-                continue
-
-            # 全視点で前方性チェック
-            front_ok = True
-            for img_id, _ in current_track:
-                info = images[img_id]
-                X_cam = info.R_cw @ Xw + info.t_cw.reshape(3, 1)
-                if X_cam[2, 0] <= 1e-6:
-                    front_ok = False
-                    break
-            if not front_ok:
-                continue
-
-            # ---- 出力集合への登録 ----
-            X_final = Xw.ravel()
-
-            # 代表観測: 最も reprojection error が小さい観測
-            best_idx = int(np.argmin(errs_final))
-            rep_obs = current_track[best_idx]  # (image_id, kp_idx)
-
-            # 3DGS用 (>=2視点)
-            if config.use_two_view_tracks_for_gs and len(current_track) >= 2:
-                points_gs.append(X_final)
-                reps_gs.append(rep_obs)
-                tracks_gs.append(list(current_track))
-
-            # 評価用 (>=3視点)
-            if (not config.use_two_view_tracks_for_eval) and len(current_track) >= 3:
-                points_eval.append(X_final)
-
-    # まず強トラックを処理して骨格点群を得る
-    process_track_list(strong_tracks)
-    # その後、弱トラックを処理して不足分を補う
-    process_track_list(weak_tracks)
-
-    if len(points_gs) == 0:
-        points_gs_arr = np.zeros((0, 3), dtype=np.float64)
-    else:
-        points_gs_arr = np.vstack(points_gs)
-
-    if len(points_eval) == 0:
-        points_eval_arr = np.zeros((0, 3), dtype=np.float64)
-    else:
-        points_eval_arr = np.vstack(points_eval)
-
-    return points_gs_arr, points_eval_arr, reps_gs, tracks_gs
+    return np.vstack(points_init), tracks_kept, np.array(mask_strong, dtype=bool)
 
 
 
@@ -1314,165 +1317,253 @@ def build_joint_ba_sparsity(
 
     return sparsity
 
+class IterativeRefiner:
+    def __init__(self, images: Dict[int, ImageInfo], config: BaselineConfig):
+        self.images = images
+        self.config = config
+        
+        # 焦点距離の目安（Lossのスケール調整用）
+        some_info = next(iter(images.values()))
+        self.f_scale = 0.5 * (some_info.K[0,0] + some_info.K[1,1])
+        
+        # 初期ポーズの保存（Priors用）
+        self.priors = {}
+        for iid, info in images.items():
+            rvec, _ = cv2.Rodrigues(info.R_cw)
+            self.priors[iid] = {
+                'rvec': rvec.ravel(),
+                'tvec': info.t_cw.copy()
+            }
 
-def bundle_adjustment_points_and_poses(
+    def _optimize_single_camera(
+        self, 
+        img_id: int, 
+        anchor_tracks: List[Tuple[int, np.ndarray]], # [(pt_idx, point3d), ...]
+        w_rot: float, 
+        w_trans: float
+    ):
+        """
+        単一カメラのポーズを、アンカー点との再投影誤差 + 初期値Priors で最適化する。
+        """
+        info = self.images[img_id]
+        prior = self.priors[img_id]
+        
+        # 初期値
+        rvec_curr, _ = cv2.Rodrigues(info.R_cw)
+        tvec_curr = info.t_cw
+        x0 = np.hstack([rvec_curr.ravel(), tvec_curr.ravel()])
+        
+        # 観測データ
+        obs_uvs = []
+        pts_3d = []
+        for kp_idx, Xw in anchor_tracks:
+            obs_uvs.append(info.keypoints_norm[kp_idx])
+            pts_3d.append(Xw)
+            
+        obs_uvs = np.array(obs_uvs)
+        pts_3d = np.array(pts_3d)
+        n_obs = len(obs_uvs)
+        
+        if n_obs < 4:
+            return # 拘束不足なら更新しない
+
+        def residuals(x):
+            r = x[:3]
+            t = x[3:]
+            
+            # 1. Reprojection
+            R, _ = cv2.Rodrigues(r)
+            # Vectorized projection
+            X_cam = (R @ pts_3d.T).T + t # (N, 3)
+            z = X_cam[:, 2]
+            
+            valid = z > 1e-6
+            res_reproj = np.zeros(n_obs * 2)
+            
+            if np.any(valid):
+                u = X_cam[valid, 0] / z[valid]
+                v = X_cam[valid, 1] / z[valid]
+                res_reproj[0::2][valid] = u - obs_uvs[valid, 0]
+                res_reproj[1::2][valid] = v - obs_uvs[valid, 1]
+            
+            # Invalid points penalty
+            if np.any(~valid):
+                res_reproj[0::2][~valid] = 10.0
+                res_reproj[1::2][~valid] = 10.0
+
+            # 2. Priors
+            res_prior_r = (r - prior['rvec']) * w_rot
+            res_prior_t = (t - prior['tvec']) * w_trans
+            
+            return np.hstack([res_reproj, res_prior_r, res_prior_t])
+
+        # Optimize
+        res = least_squares(
+            residuals, x0, 
+            method='trf', 
+            loss='huber', f_scale=1.0/self.f_scale,
+            max_nfev=50, # 小刻みに回すので少なめでOK
+            verbose=0
+        )
+        
+        # Update
+        r_opt = res.x[:3]
+        t_opt = res.x[3:]
+        R_opt, _ = cv2.Rodrigues(r_opt)
+        
+        info.R_cw = R_opt
+        info.t_cw = t_opt
+        info.C = -R_opt.T @ t_opt
+
+    def _optimize_points_subset(self, points: np.ndarray, tracks: List[List[Tuple[int, int]]], subset_indices: List[int]):
+        """
+        指定されたインデックスの3D点のみを最適化する（カメラ固定）。
+        """
+        for i in subset_indices:
+            track = tracks[i]
+            Xw = points[i]
+            
+            # 高速化のため、scipyを使わず簡易Gauss-Newton等を自作するか、
+            # あるいは既存の refine_point_ba を呼び出す。
+            # ここでは既存関数を流用（ただし呼び出しコストに注意）
+            X_new = refine_point_ba(Xw, track, self.images, self.config, self.f_scale)
+            points[i] = X_new
+
+    def run(self, points: np.ndarray, tracks: List[List[Tuple[int, int]]], iterations: int = 3):
+        """
+        交互最適化のメインループ
+        """
+        num_points = points.shape[0]
+        if num_points == 0:
+            return points
+
+        # 設定値（少し強めのPriorから始める）
+        w_rot = self.config.ba_pose_weight_rot
+        w_trans = self.config.ba_pose_weight_trans
+        
+        print(f"Starting Iterative Refinement ({iterations} iters)...")
+        
+        for it in range(iterations):
+            print(f"  Iteration {it+1}/{iterations}")
+            
+            # --- Step 1: Select Anchors ---
+            # 各反復で、「現在」のポーズと点群から見て信頼できる点を再選定する
+            # (幾何が改善されれば、アンカーとして使える点が増える可能性がある)
+            anchor_indices = []
+            
+            # Image ID -> List of (pt_idx, point3d)
+            cam_observations = {iid: [] for iid in self.images.keys()}
+            
+            # シーン中心（視差角計算用）
+            # 簡易的に計算（厳密でなくても良い）
+            # scene_center = points.mean(axis=0) 
+            
+            for i in range(num_points):
+                track = tracks[i]
+                Xw = points[i]
+                
+                # 条件: トラック長 >= 3 かつ 視差角が十分大きい
+                # ここでは厳し目にフィルタリングする
+                min_ang = compute_min_triangulation_angle_deg(track, self.images, Xw)
+                
+                # アンカー条件: 視差角が 2.0度以上 (設定依存)
+                if len(track) >= 3 and min_ang >= 2.0:
+                    anchor_indices.append(i)
+                    for img_id, kp_idx in track:
+                        # ここで point のコピーを渡さないと、後で point が更新されたときに整合性が崩れるが、
+                        # Step 2 では point は固定なので参照でもOK。念のためコピー。
+                        cam_observations[img_id].append((kp_idx, Xw.copy()))
+            
+            print(f"    Anchors selected: {len(anchor_indices)} / {num_points} points")
+            if len(anchor_indices) < 10:
+                print("    Too few anchors! Skipping pose update.")
+            else:
+                # --- Step 2: Optimize Cameras (Independent) ---
+                # 各カメラを独立に最適化（並列化可能だがここではforループ）
+                # アンカー点のみを使用する
+                for img_id in self.images:
+                    obs = cam_observations[img_id]
+                    if len(obs) < 4: continue # 観測が少なすぎるカメラはスキップ
+                    
+                    self._optimize_single_camera(img_id, obs, w_rot, w_trans)
+                
+            # --- Step 3: Optimize All Points (Independent) ---
+            # 更新されたカメラに対して、全点を最適化
+            # ここは並列化すると速いが、Pythonスレッドオーバーヘッドもあるので愚直に
+            # 全点を一気に回す
+            all_indices = list(range(num_points))
+            self._optimize_points_subset(points, tracks, all_indices)
+
+        return points
+
+def filter_bad_points_after_ba(
     points: np.ndarray,
     tracks: List[List[Tuple[int, int]]],
     images: Dict[int, ImageInfo],
     config: BaselineConfig,
-) -> np.ndarray:
+) -> Tuple[np.ndarray, List[List[Tuple[int, int]]], List[Tuple[int, int]]]:
     """
-    Optimize camera poses (extrinsics) and 3D points jointly.
-    All poses start from the known COLMAP poses to keep the global gauge.
-    The first participating camera is kept fixed to avoid gauge freedom.
+    Joint BA後の点群から、再投影誤差が大きい点や、
+    三角測量角が極端に小さい点（デプスが不安定な点）を除去する。
+    また、色取得用の代表観測（最も中心に近い、または誤差が小さい観測）を選出する。
     """
-    num_points = points.shape[0]
-    if num_points == 0 or len(tracks) == 0:
-        return points
+    if points.shape[0] == 0:
+        return points, tracks, []
 
-    participating_ids = sorted({img_id for track in tracks for (img_id, _) in track})
-    if not participating_ids:
-        return points
-
-    ref_cam_id = participating_ids[0]
-    opt_cam_ids = [cid for cid in participating_ids if cid != ref_cam_id]
-    cam_id_to_opt = {cid: idx for idx, cid in enumerate(opt_cam_ids)}
-
-    obs_img_ids = []
-    obs_cam_indices = []
-    obs_point_indices = []
-    obs_measurements = []
-
-    for pt_idx, track in enumerate(tracks):
-        for (img_id, kp_idx) in track:
-            info = images.get(img_id)
-            if info is None or info.keypoints_norm is None:
-                continue
-            if kp_idx >= info.keypoints_norm.shape[0]:
-                continue
-            obs_img_ids.append(img_id)
-            obs_cam_indices.append(cam_id_to_opt.get(img_id, -1))
-            obs_point_indices.append(pt_idx)
-            obs_measurements.append(info.keypoints_norm[kp_idx])
-
-    num_obs = len(obs_img_ids)
-    if num_obs < 4:
-        print("Not enough observations for joint BA. Skipping pose refinement.")
-        return points
-
-    obs_img_ids = np.array(obs_img_ids, dtype=np.int32)
-    obs_cam_indices = np.array(obs_cam_indices, dtype=np.int32)
-    obs_point_indices = np.array(obs_point_indices, dtype=np.int32)
-    obs_measurements = np.array(obs_measurements, dtype=np.float64)
-
-    num_cams_opt = len(opt_cam_ids)
-
-    camera_params0 = np.zeros((num_cams_opt, 6), dtype=np.float64)
-    for idx, cam_id in enumerate(opt_cam_ids):
-        info = images[cam_id]
-        camera_params0[idx, :3] = rotmat_to_rodrigues(info.R_cw)
-        camera_params0[idx, 3:] = info.t_cw.astype(np.float64)
-
-    points0 = points.astype(np.float64).copy()
-
-    x0 = np.hstack([camera_params0.ravel(), points0.ravel()])
-
-    sparsity = build_joint_ba_sparsity(
-        obs_cam_indices,
-        obs_point_indices,
-        num_cams_opt,
-        num_points,
-    )
-
-    ref_R = images[ref_cam_id].R_cw.copy()
-    ref_t = images[ref_cam_id].t_cw.astype(np.float64).copy()
-
-    f_mean = 0.0
-    first_info = next(iter(images.values()))
-    fx = float(first_info.K[0, 0])
-    fy = float(first_info.K[1, 1])
+    # 平均焦点距離（ピクセル換算用）
+    some_info = next(iter(images.values()))
+    fx = some_info.K[0, 0]
+    fy = some_info.K[1, 1]
     f_mean = 0.5 * (fx + fy)
-    f_scale_norm = config.ba_loss_scale_px / max(f_mean, 1e-6)
+    
+    # 閾値設定（BA後なので、やや厳し目に見る）
+    # 平均誤差が 2.0px を超えるものは除去（設定次第）
+    max_mean_err_px = 2.0 
+    
+    kept_points = []
+    kept_tracks = []
+    kept_reps = [] # 色サンプリング用の代表観測 (image_id, kp_idx)
 
-    def residuals(param_vec: np.ndarray) -> np.ndarray:
-        camera_params = (
-            param_vec[: num_cams_opt * 6].reshape(num_cams_opt, 6)
-            if num_cams_opt > 0
-            else np.zeros((0, 6), dtype=np.float64)
-        )
-        points_3d = param_vec[num_cams_opt * 6 :].reshape(num_points, 3)
-        res = np.zeros(num_obs * 2, dtype=np.float64)
+    for i in range(points.shape[0]):
+        Xw = points[i]
+        track = tracks[i]
+        
+        # 1. 再投影誤差の計算 (px)
+        rms_err, errs = compute_reproj_errors_px_point(Xw, track, images)
+        
+        # 平均誤差チェック
+        if rms_err > max_mean_err_px:
+            continue
+            
+        # 2. 三角測量角のチェック
+        min_angle = compute_min_triangulation_angle_deg(track, images, Xw)
+        if min_angle < config.tri_min_angle_deg:
+            continue
+            
+        # 3. 前方性チェック（念のため）
+        is_front = True
+        for (img_id, _) in track:
+            info = images[img_id]
+            X_cam = info.R_cw @ Xw.reshape(3,1) + info.t_cw.reshape(3,1)
+            if X_cam[2] < 1e-4:
+                is_front = False
+                break
+        if not is_front:
+            continue
 
-        for obs_idx in range(num_obs):
-            pt_idx = obs_point_indices[obs_idx]
-            cam_idx = obs_cam_indices[obs_idx]
-            img_id = obs_img_ids[obs_idx]
-            obs = obs_measurements[obs_idx]
+        # 4. 代表観測の選出
+        # ここでは再投影誤差が最も小さい観測を代表とする
+        best_idx = np.argmin(errs)
+        rep_obs = track[best_idx]
 
-            if cam_idx < 0:
-                R = ref_R
-                t = ref_t
-            else:
-                rvec = camera_params[cam_idx, :3]
-                tvec = camera_params[cam_idx, 3:]
-                R = rodrigues_to_rotmat(rvec)
-                t = tvec
+        kept_points.append(Xw)
+        kept_tracks.append(track)
+        kept_reps.append(rep_obs)
 
-            X = points_3d[pt_idx].reshape(3, 1)
-            X_cam = R @ X + t.reshape(3, 1)
-            z = float(X_cam[2, 0])
-            if z <= 1e-8:
-                res[2 * obs_idx : 2 * obs_idx + 2] = 1e3
-                continue
-            xn = X_cam[0, 0] / z
-            yn = X_cam[1, 0] / z
-            res[2 * obs_idx] = xn - obs[0]
-            res[2 * obs_idx + 1] = yn - obs[1]
+    if not kept_points:
+        return np.zeros((0, 3)), [], []
 
-        return res
-
-    print(
-        f"Running joint bundle adjustment on {num_points} points "
-        f"and {len(participating_ids)} cameras (ref={ref_cam_id})."
-    )
-    result = least_squares(
-        residuals,
-        x0,
-        jac_sparsity=sparsity,
-        loss="huber",
-        f_scale=f_scale_norm,
-        max_nfev=config.ba_max_nfev,
-        verbose=1,
-    )
-    print(f"Joint BA finished. success={result.success}, cost={result.cost:.3e}")
-
-    params_opt = result.x
-    if num_cams_opt > 0:
-        camera_params_opt = params_opt[: num_cams_opt * 6].reshape(num_cams_opt, 6)
-    else:
-        camera_params_opt = np.zeros((0, 6), dtype=np.float64)
-    points_opt = params_opt[num_cams_opt * 6 :].reshape(num_points, 3)
-
-    # Update poses (non-reference cameras)
-    for idx, cam_id in enumerate(opt_cam_ids):
-        info = images[cam_id]
-        rvec = camera_params_opt[idx, :3]
-        tvec = camera_params_opt[idx, 3:]
-        R_new = rodrigues_to_rotmat(rvec)
-        t_new = tvec.astype(np.float64)
-        info.R_cw = R_new
-        info.t_cw = t_new
-        info.C = -R_new.T @ t_new.reshape(3, 1)
-        info.C = info.C.ravel()
-
-    # Reference camera stays unchanged but ensure C is up to date
-    ref_info = images[ref_cam_id]
-    ref_info.C = -ref_info.R_cw.T @ ref_info.t_cw.reshape(3, 1)
-    ref_info.C = ref_info.C.ravel()
-
-    points[:, :] = points_opt
-    return points
-
+    return np.array(kept_points), kept_tracks, kept_reps
 
 def compute_reproj_errors_px_point(
     Xw: np.ndarray,
@@ -1680,6 +1771,120 @@ def write_points_to_ply(points: np.ndarray, ply_path: str, colors: np.ndarray = 
 
 
 
+def save_colmap_reconstruction(
+    output_dir: str,
+    images: Dict[int, ImageInfo],
+    points: np.ndarray,
+    tracks: List[List[Tuple[int, int]]],
+    colors: Optional[np.ndarray],
+    per_point_rms: Optional[np.ndarray]
+) -> None:
+    """
+    最適化後のカメラと点群をCOLMAP形式 (images.txt, points3D.txt) で出力する。
+    画像上の特徴点と3D点のID対応付けも行う。
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    images_txt_path = os.path.join(output_dir, "images.txt")
+    points3d_txt_path = os.path.join(output_dir, "points3D.txt")
+    
+    num_points = points.shape[0]
+    
+    # 色とエラー情報のデフォルト値
+    if colors is None or colors.shape[0] != num_points:
+        colors = np.full((num_points, 3), 255, dtype=np.uint8)
+    if per_point_rms is None or per_point_rms.shape[0] != num_points:
+        per_point_rms = np.zeros((num_points,), dtype=np.float64)
+
+    # -------------------------------------------------------
+    # 1. 3D点IDのマッピング構築
+    # -------------------------------------------------------
+    # trackに含まれる (img_id, kp_idx) -> point3d_id の逆引き辞書を作成
+    # COLMAPのPoint3D IDは1から始めるのが通例
+    
+    # key: img_id, val: { kp_idx: point3d_id }
+    feature_to_point_map: Dict[int, Dict[int, int]] = {}
+    
+    # 全画像を初期化
+    for img_id in images:
+        feature_to_point_map[img_id] = {}
+
+    for i in range(num_points):
+        point3d_id = i + 1
+        for (img_id, kp_idx) in tracks[i]:
+            if img_id in feature_to_point_map:
+                feature_to_point_map[img_id][kp_idx] = point3d_id
+
+    # -------------------------------------------------------
+    # 2. Write images.txt
+    # -------------------------------------------------------
+    print(f"Writing images.txt to {images_txt_path} ...")
+    with open(images_txt_path, "w") as f:
+        f.write("# Image list with two lines of data per image:\n")
+        f.write("#   IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME\n")
+        f.write("#   POINTS2D[] as (X, Y, POINT3D_ID)\n")
+        f.write(f"# Number of images: {len(images)}, mean observations per image: ...\n")
+
+        # image_id順にソートして出力
+        sorted_img_ids = sorted(images.keys())
+        
+        for img_id in sorted_img_ids:
+            info = images[img_id]
+            qvec = rotmat2qvec(info.R_cw)
+            tvec = info.t_cw
+            
+            # Line 1: Pose
+            # CAMERA_ID はここでは簡易的に 1 固定とする（単一カメラ想定）
+            cam_id = 1 
+            f.write(f"{img_id} {qvec[0]} {qvec[1]} {qvec[2]} {qvec[3]} "
+                    f"{tvec[0]} {tvec[1]} {tvec[2]} {cam_id} {info.name}\n")
+            
+            # Line 2: 2D Points
+            # 特徴点配列がある場合のみ出力
+            if info.keypoints_px is not None:
+                kps = info.keypoints_px
+                num_kps = kps.shape[0]
+                
+                point_strings = []
+                # マッピング辞書
+                kp_map = feature_to_point_map.get(img_id, {})
+                
+                for k_idx in range(num_kps):
+                    x, y = kps[k_idx]
+                    # この特徴点が3D点に関連付けられていればそのID、なければ -1
+                    p3d_id = kp_map.get(k_idx, -1)
+                    point_strings.append(f"{x} {y} {p3d_id}")
+                
+                f.write(" ".join(point_strings) + "\n")
+            else:
+                f.write("\n")
+
+    # -------------------------------------------------------
+    # 3. Write points3D.txt
+    # -------------------------------------------------------
+    print(f"Writing points3D.txt to {points3d_txt_path} ...")
+    with open(points3d_txt_path, "w") as f:
+        f.write("# 3D point list with one line of data per point:\n")
+        f.write("#   POINT3D_ID, X, Y, Z, R, G, B, ERROR, TRACK[] as (IMAGE_ID, POINT2D_IDX)\n")
+        f.write(f"# Number of points: {num_points}\n")
+
+        for i in range(num_points):
+            point3d_id = i + 1
+            X = points[i]
+            c = colors[i]
+            err = per_point_rms[i]
+            tr = tracks[i]
+
+            # Header info
+            f.write(f"{point3d_id} {X[0]} {X[1]} {X[2]} {c[0]} {c[1]} {c[2]} {err}")
+            
+            # Track info
+            for (img_id, kp_idx) in tr:
+                f.write(f" {img_id} {kp_idx}")
+            f.write("\n")
+
+    print("COLMAP export finished.")
+
+
 # ============================================================
 # Visualization (matplotlib 3D)
 # ============================================================
@@ -1771,131 +1976,95 @@ def parse_args() -> argparse.Namespace:
     )
     return parser.parse_args()
 
-
 def main():
     args = parse_args()
     config = BaselineConfig()
+    
+    # パラメータ調整:
+    # 交互最適化ではポーズを少し動きやすくしても発散しにくい。
+    # アンカーのみを使うため、ノイズの影響を受けにくいからである。
+    config.ba_pose_weight_rot = 1   # 必要に応じて調整 (0.1 ~ 10.0)
+    config.ba_pose_weight_trans = 1
+    config.tri_min_angle_deg = 4.0    # アンカー選定基準
 
-    # 1) Load intrinsics
+    # 1. Load Data
     K, dist = load_intrinsics_from_yaml(args.intrinsics_yaml)
-    print("Loaded intrinsics:")
-    print(K)
-    print("dist:", dist)
-
-    # 2) Load poses (COLMAP images.txt)
     images = load_colmap_images_txt(args.images_txt, K, dist)
-    print(f"Loaded {len(images)} camera poses from images.txt")
 
-    # 3) Feature extraction
-    print("Extracting SIFT + RootSIFT features...")
+    # 画像ポーズの初期状態をディープコピーして保存（比較用）
+    print("Snapshotting initial poses for comparison...")
+    images_init = copy.deepcopy(images)
+
+    # 2. Features & Matching & Tracks
+    # (既存のコードと同じ)
     extract_features(args.image_dir, images, config)
-    print("Feature extraction done.")
-
-    # 4) Pair selection
-    print("Selecting image pairs using known poses...")
     pairs = build_image_pairs(images, config)
-    print(f"Selected {len(pairs)} pairs.")
-
-    # 5) Matching + geometric verification
-    print("Matching features for all pairs...")
     all_matches = match_all_pairs(images, pairs, config)
-    print(f"Total verified matches: {len(all_matches)}")
-
-    if len(all_matches) == 0:
-        print("No verified matches. Aborting.")
-        return
-
-    # 6) Track construction
-    print("Building multi-view tracks...")
     tracks = build_tracks(images, all_matches)
-    print(f"Constructed {len(tracks)} tracks (>=2 views).")
 
-    if len(tracks) == 0:
-        print("No valid tracks. Aborting.")
+    # 3. Initialization (DLT Only)
+    # ここで "filter_and_collect_points" は使わず、DLTで初期値を決めるだけの関数を使う
+    # (前回の回答にある collect_points_for_joint_ba のロジックを使用)
+    print("\n--- Phase 1: Initialization (DLT) ---")
+    points_init, tracks_init, _ = collect_points_for_joint_ba(tracks, images, config)
+    # mask_strong は IterativeRefiner 内部で動的に再計算するため、ここでは不要
+    
+    print(f"Initial raw points: {points_init.shape[0]}")
+    if points_init.shape[0] == 0:
         return
 
-    # 7) Triangulation + point-only BA + filtering
-    print("Triangulating and refining points with fixed known poses...")
-    points_gs, points_eval, reps_gs, tracks_gs = filter_and_collect_points(tracks, images, config)
-    print(f"Raw points for 3DGS (before 3D outlier removal): {points_gs.shape[0]}")
-    print(f"Points for evaluation (>=3 views): {points_eval.shape[0]}")
+    # 4. Iterative Refinement (Round-Robin)
+    print("\n--- Phase 2: Iterative Refinement (Alternating Optimization) ---")
+    # 交互最適化の実行
+    refiner = IterativeRefiner(images, config)
+    points_refined = refiner.run(points_init, tracks_init, iterations=5)
 
-    # 7.5) 3Dレベルでの Statistical Outlier Removal（従来実装そのまま）
-    if points_gs.shape[0] > 0:
-        print("Applying 3D Statistical Outlier Removal to 3DGS points...")
-        points_gs_filtered, mask = statistical_outlier_removal(
-            points_gs,
-            k_neighbors=20,
-            std_ratio=2.0,
-        )
-        print(
-            f"3DGS points after SOR: {points_gs_filtered.shape[0]} "
-            f"(removed {points_gs.shape[0] - points_gs_filtered.shape[0]})"
-        )
+    # --- ここで変化量を出力 ---
+    # images は refiner.run の内部で直接更新されている
+    report_pose_changes(images_init, images)
 
-        reps_gs_filtered = [r for r, m in zip(reps_gs, mask) if m]
-        tracks_gs_filtered = [tr for tr, m in zip(tracks_gs, mask) if m]  # ★ track も同様にフィルタ
+    # 5. Final Filtering & Output
+    # (既存のコードと同じ)
+    print("\n--- Phase 3: Filtering Bad Points ---")
+    points_filtered, tracks_filtered, reps_filtered = filter_bad_points_after_ba(
+        points_refined, tracks_init, images, config
+    )
+    
+    if points_filtered.shape[0] > 0:
+        print("Applying Statistical Outlier Removal (SOR)...")
+        points_final, mask_sor = statistical_outlier_removal(points_filtered)
+        tracks_final = [t for t, m in zip(tracks_filtered, mask_sor) if m]
+        reps_final = [r for r, m in zip(reps_filtered, mask_sor) if m]
     else:
-        points_gs_filtered = points_gs
-        reps_gs_filtered = reps_gs
-        tracks_gs_filtered = tracks_gs
+        points_final = points_filtered
+        tracks_final = tracks_filtered
+        reps_final = reps_filtered
 
-    # 7.75) Joint bundle adjustment (poses + points)
-    if points_gs_filtered.shape[0] > 0 and len(tracks_gs_filtered) > 0:
-        points_gs_filtered = bundle_adjustment_points_and_poses(
-            points_gs_filtered,
-            tracks_gs_filtered,
-            images,
-            config,
-        )
+    # Output PLY / points3D.txt
+    if points_final.shape[0] > 0:
+        colors = compute_point_colors_from_observations(reps_final, images, args.image_dir)
+    # 再投影誤差の計算
+    print("Computing final reprojection errors...")
+    per_point_rms, all_obs_errs = compute_reproj_errors_px_for_all(
+        points_final, tracks_final, images
+    )
+    report_reprojection_error_stats(all_obs_errs)
 
-    # 8) Output PLY (for 3DGS) with colors
-    colors_gs = None
-    if points_gs_filtered.shape[0] > 0:
-        print("Sampling colors for 3DGS points from representative observations...")
-        colors_gs = compute_point_colors_from_observations(
-            reps_gs_filtered,
-            images,
-            args.image_dir,
-        )
+    # --- 最終出力: COLMAP形式 ---
+    output_dir = "known_pose_BA"
+    print(f"Exporting optimized model to directory: {output_dir}")
+    save_colmap_reconstruction(
+        output_dir,
+        images,          # 最適化後の画像ポーズ
+        points_final,    # フィルタリング後の点群
+        tracks_final,    # 対応するトラック
+        colors,          # 色
+        per_point_rms    # エラー値
+    )
 
-    if args.output_ply is not None:
-        write_points_to_ply(points_gs_filtered, args.output_ply, colors=colors_gs)
-
-    # 8.5) 再投影誤差 (px) の算出と統計
-    if points_gs_filtered.shape[0] > 0:
-        print("Computing reprojection errors (px) for reconstructed points...")
-        per_point_rms_px, all_obs_errs_px = compute_reproj_errors_px_for_all(
-            points_gs_filtered,
-            tracks_gs_filtered,
-            images,
-        )
-        report_reprojection_error_stats(all_obs_errs_px)
-    else:
-        per_point_rms_px = np.zeros((0,), dtype=np.float64)
-        print("No points for reprojection error computation.")
-
-
-    # 9) Write COLMAP-style points3D.txt
-    if args.output_points3d is not None and points_gs_filtered.shape[0] > 0:
-        write_points3D_txt(
-            points_gs_filtered,
-            tracks_gs_filtered,
-            colors_gs,
-            per_point_rms_px,
-            args.output_points3d,
-        )
-
-    # 10) Visualization
-    if not args.no_show:
-        visualize_reconstruction(
-            images,
-            points_gs_filtered if points_gs_filtered.size > 0 else points_eval,
-            title="Known-pose sparse reconstruction (3DGS initialization, filtered)",
-            save_path="reconstruction.png",
-        )
-
-
+    # 必要であれば PLY も出力
+    if args.output_ply:
+        write_points_to_ply(points_final, args.output_ply, colors=colors)
 
 if __name__ == "__main__":
     main()
