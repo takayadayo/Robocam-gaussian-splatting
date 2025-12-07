@@ -79,7 +79,7 @@ class BaselineConfig:
     # BA iterations
     ba_max_nfev: int = 500
 
-
+output_dir = "known_pose_base"
 
 # ============================================================
 # Data structures
@@ -1646,7 +1646,7 @@ def main():
         )
 
     if args.output_ply is not None:
-        write_points_to_ply(points_gs_filtered, args.output_ply, colors=colors_gs)
+        write_points_to_ply(points_gs_filtered, f"{output_dir}/{args.output_ply}", colors=colors_gs)
 
     # 8.5) 再投影誤差 (px) の算出と統計
     if points_gs_filtered.shape[0] > 0:
@@ -1669,7 +1669,7 @@ def main():
             tracks_gs_filtered,
             colors_gs,
             per_point_rms_px,
-            args.output_points3d,
+            f"{output_dir}/{args.output_points3d}",
         )
 
     # 10) Visualization
@@ -1678,7 +1678,7 @@ def main():
             images,
             points_gs_filtered if points_gs_filtered.size > 0 else points_eval,
             title="Known-pose sparse reconstruction (3DGS initialization, filtered)",
-            save_path="reconstruction.png",
+            save_path=f"{output_dir}/reconstruction.png",
         )
 
 
