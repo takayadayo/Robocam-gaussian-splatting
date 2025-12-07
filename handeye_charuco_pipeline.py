@@ -1453,7 +1453,7 @@ def main():
         rvecs=rvecs,
         tvecs=tvecs,
         euler_order="XYZ",
-        max_iters=10,
+        max_iters=0,
         lambda_init=1e-3,
         verbose=True,
     )

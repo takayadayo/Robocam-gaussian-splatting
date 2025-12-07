@@ -2,7 +2,7 @@
 undistort_for_colmap.py
 
 Usage:
-    python known_pose_sfm_BA.py --images_txt output\images.txt --intrinsics_yaml sfm_out\intrinsics.yaml --image_dir 3dgs_input\images --output_ply known_pose_BA/output_points_BA.ply
+    python known_pose_sfm_BA.py --images_txt output\images.txt --intrinsics_yaml sfm_out\intrinsics.yaml --image_dir undistortion\images --output_ply known_pose_BA/output_points_BA.ply
 
 Description:
     - Loads K, dist from YAML.
@@ -17,6 +17,8 @@ import glob
 import shutil
 import cv2
 import numpy as np
+
+from typing import Dict
 
 def load_intrinsics(yaml_path):
     fs = cv2.FileStorage(yaml_path, cv2.FILE_STORAGE_READ)
@@ -52,6 +54,14 @@ def rotmat2qvec(R):
     if q[0] < 0:
         q *= -1
     return q
+
+def save_yaml(path: str, data: Dict[str, np.ndarray]):
+    fs = cv2.FileStorage(path, cv2.FILE_STORAGE_WRITE)
+    if not fs.isOpened():
+        raise RuntimeError(f"Could not open {path} for writing.")
+    for k, v in data.items():
+        fs.write(k, np.array(v))
+    fs.release()
 
 def main():
     parser = argparse.ArgumentParser()
@@ -123,6 +133,19 @@ def main():
         # ID is 1
         f.write(f"1 PINHOLE {w} {h} {fx:.16f} {fy:.16f} {cx:.16f} {cy:.16f}\n")
     print(f"Wrote {cameras_txt_path}")
+    
+    # 3.5 追加：cameras.txtに書き込む内部パラメータを入力のyamlファイルにも書き込み、再構成処理に直接つなぐ。
+    # 内部パラメータ出力
+    intrinsics_path = os.path.join(args.intrinsics_yaml)
+    dist = np.zeros((5, 1), dtype=np.float64)
+    save_yaml(
+        intrinsics_path,
+        {
+            "K": new_K,
+            "dist": dist,
+        },
+    )
+    print(f"[INFO] wrote intrinsics to {intrinsics_path}")
 
     # 4. Process images.txt
     # Poses (R, t) do NOT change because the camera center and orientation 
