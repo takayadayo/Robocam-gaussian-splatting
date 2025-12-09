@@ -58,7 +58,7 @@ class BaselineConfig:
     # Matching
     sift_ratio: float = 0.7
     cross_check: bool = True
-    geom_max_error_px: float = 0.4   # ★ 4→3 に引き締め（エピポーラ誤差）
+    geom_max_error_px: float = 2   # ★ 4→3 に引き締め（エピポーラ誤差）
     geom_confidence: float = 0.999
     geom_min_inlier_ratio: float = 0.25
     geom_min_num_inliers: int = 10
@@ -673,29 +673,6 @@ def symmetric_epipolar_distance_sq(
     d_sym_sq = d1_sq + d2_sq
     return d_sym_sq
 
-def geom_verify_with_ransac_essential(
-    pts1_norm: np.ndarray,
-    pts2_norm: np.ndarray,
-    th_norm: float,
-    prob: float = 0.999,
-) -> np.ndarray:
-    """
-    正規化座標 (x,y) で Essential を RANSAC 推定し、inlier mask を返す。
-    OpenCV findEssentialMat は focal=1, pp=(0,0) で正規化座標扱いにできる。
-    """
-    if len(pts1_norm) < 5:
-        return np.zeros((len(pts1_norm),), dtype=bool)
-
-    E, mask = cv2.findEssentialMat(
-        pts1_norm, pts2_norm,
-        focal=1.0, pp=(0.0, 0.0),
-        method=cv2.RANSAC,
-        prob=prob,
-        threshold=float(th_norm),
-    )
-    if mask is None:
-        return np.zeros((len(pts1_norm),), dtype=bool)
-    return (mask.ravel() > 0)
 
 def match_features_for_pair(
     img_i: ImageInfo,
@@ -753,7 +730,13 @@ def match_features_for_pair(
     pts1 = np.float64([img_i.keypoints_norm[i] for (i, _) in mutual_pairs])
     pts2 = np.float64([img_j.keypoints_norm[j] for (_, j) in mutual_pairs])
 
-    # 視差角スケールまでは既存ロジックを踏襲
+    E_known = compute_known_essential_matrix(img_i, img_j)
+    d_sym_sq = symmetric_epipolar_distance_sq(E_known, pts1, pts2)
+
+    # 4) 視差角に応じてエピポーラ閾値をスケーリング
+    #    - angle <= 2deg なら 0.5 * geom_max_error_px
+    #    - angle >= 5deg なら 1.0 * geom_max_error_px
+    #    - その間は線形補間
     base_px = config.geom_max_error_px
     if angle_pair_deg <= 2.0:
         scale = 0.5
@@ -764,18 +747,10 @@ def match_features_for_pair(
         scale = 0.5 + 0.5 * t
 
     th_norm = (base_px * scale) / max(f_mean, 1e-6)
+    th_norm_sq = th_norm * th_norm
 
-    # まず RANSAC(E) でインライア抽出（COLMAP の思想に寄せる）
-    inlier_mask = geom_verify_with_ransac_essential(pts1, pts2, th_norm, prob=0.999)
-
+    inlier_mask = d_sym_sq <= th_norm_sq
     inlier_pairs = [pair for pair, ok in zip(mutual_pairs, inlier_mask) if ok]
-
-    # fallback: それでも足りない場合のみ known E（現状の実装）を使う
-    if len(inlier_pairs) < config.geom_min_num_inliers:
-        E_known = compute_known_essential_matrix(img_i, img_j)
-        d_sym_sq = symmetric_epipolar_distance_sq(E_known, pts1, pts2)
-        inlier_mask2 = (d_sym_sq <= (th_norm * th_norm))
-        inlier_pairs = [pair for pair, ok in zip(mutual_pairs, inlier_mask2) if ok]
 
     if len(inlier_pairs) < config.geom_min_num_inliers:
         return []
