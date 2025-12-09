@@ -58,7 +58,7 @@ class BaselineConfig:
     # Matching
     sift_ratio: float = 0.7
     cross_check: bool = True
-    geom_max_error_px: float = 2   # ★ 4→3 に引き締め（エピポーラ誤差）
+    geom_max_error_px: float = 0.2   # ★ 4→3 に引き締め（エピポーラ誤差）
     geom_confidence: float = 0.999
     geom_min_inlier_ratio: float = 0.25
     geom_min_num_inliers: int = 10
@@ -2001,7 +2001,7 @@ def main():
     print("\n--- Phase 2: Iterative Refinement (Alternating Optimization) ---")
     # 交互最適化の実行
     refiner = IterativeRefiner(images, config)
-    points_refined = refiner.run(points_init, tracks_init, iterations=10)
+    points_refined = refiner.run(points_init, tracks_init, iterations=20)
 
     # --- ここで変化量を出力 ---
     # images は refiner.run の内部で直接更新されている
