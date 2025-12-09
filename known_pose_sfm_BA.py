@@ -1451,7 +1451,7 @@ class IterativeRefiner:
                 min_ang = compute_min_triangulation_angle_deg(track, self.images, Xw)
                 
                 # アンカー条件: 視差角が 2.0度以上 (設定依存)
-                if len(track) >= 2 and min_ang >= 3.0:
+                if len(track) >= 3 and min_ang >= 4.0:
                     anchor_indices.append(i)
                     for img_id, kp_idx in track:
                         # ここで point のコピーを渡さないと、後で point が更新されたときに整合性が崩れるが、
