@@ -99,53 +99,56 @@ def main():
     # alpha=0: 画像の有効範囲内のみを切り出す（黒枠なし、ズームされる）
     # alpha=1: 全画素を残す（黒枠が出る可能性あり）。3DGSには黒枠は悪影響なので alpha=0 推奨。
     new_K, roi = cv2.getOptimalNewCameraMatrix(K, dist, (w, h), args.alpha, (w, h))
-    
-    # 3DGS用に黒枠が出ないようクロップするための map 生成
-    mapx, mapy = cv2.initUndistortRectifyMap(K, dist, None, new_K, (w, h), 5)
 
-    print("New K (Pinhole):\n", new_K)
+    # ROI crop をするか（alpha=0 のときは基本 crop 推奨）
+    x, y, rw, rh = roi
+    do_crop = (args.alpha == 0.0) and (rw > 0) and (rh > 0)
 
-    print(f"Undistorting {len(image_paths)} images...")
+    # map は (w,h) で作って、最後に crop する
+    mapx, mapy = cv2.initUndistortRectifyMap(K, dist, None, new_K, (w, h), cv2.CV_32FC1)
+
+    # crop するなら、K の主点を ROI 原点ぶんだけ補正し、出力サイズも更新
+    K_out = new_K.copy()
+    out_w, out_h = w, h
+    if do_crop:
+        K_out[0, 2] -= float(x)
+        K_out[1, 2] -= float(y)
+        out_w, out_h = int(rw), int(rh)
+
+    print("New K (Pinhole):\n", K_out)
+    print(f"ROI: {roi}, do_crop={do_crop}, out_size=({out_w},{out_h})")
+
     for path in image_paths:
         img = cv2.imread(path)
         if img is None:
             continue
-        
-        # Remap is faster than undistort in loop
+
         undistorted = cv2.remap(img, mapx, mapy, cv2.INTER_LINEAR)
-        
+
+        if do_crop:
+            undistorted = undistorted[y:y+rh, x:x+rw]
+
         name = os.path.basename(path)
         out_path = os.path.join(out_img_dir, name)
         cv2.imwrite(out_path, undistorted)
 
-    # 3. Write cameras.txt (PINHOLE)
-    # Model: PINHOLE
-    # Params: fx, fy, cx, cy
-    fx = new_K[0, 0]
-    fy = new_K[1, 1]
-    cx = new_K[0, 2]
-    cy = new_K[1, 2]
+    # cameras.txt (PINHOLE): サイズは out_w/out_h、パラメータは K_out
+    fx, fy = float(K_out[0, 0]), float(K_out[1, 1])
+    cx, cy = float(K_out[0, 2]), float(K_out[1, 2])
 
     cameras_txt_path = os.path.join(out_sparse_dir, "cameras.txt")
     with open(cameras_txt_path, "w") as f:
         f.write("# Camera list with one line of data per camera.\n")
         f.write("# CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n")
-        # ID is 1
-        f.write(f"1 PINHOLE {w} {h} {fx:.16f} {fy:.16f} {cx:.16f} {cy:.16f}\n")
+        f.write(f"1 PINHOLE {out_w} {out_h} {fx:.16f} {fy:.16f} {cx:.16f} {cy:.16f}\n")
     print(f"Wrote {cameras_txt_path}")
-    
-    # 3.5 追加：cameras.txtに書き込む内部パラメータを入力のyamlファイルにも書き込み、再構成処理に直接つなぐ。
-    # 内部パラメータ出力
-    intrinsics_path = os.path.join(args.intrinsics_yaml)
-    dist = np.zeros((5, 1), dtype=np.float64)
-    save_yaml(
-        intrinsics_path,
-        {
-            "K": new_K,
-            "dist": dist,
-        },
-    )
-    print(f"[INFO] wrote intrinsics to {intrinsics_path}")
+
+    # intrinsics.yaml は「入力を上書き」せず、出力側へ保存（事故防止）
+    intrinsics_out_path = os.path.join(args.output_dir, "intrinsics.yaml")
+    dist0 = np.zeros((5, 1), dtype=np.float64)
+    save_yaml(intrinsics_out_path, {"K": K_out, "dist": dist0})
+    print(f"[INFO] wrote intrinsics to {intrinsics_out_path}")
+
 
     # 4. Process images.txt
     # Poses (R, t) do NOT change because the camera center and orientation 

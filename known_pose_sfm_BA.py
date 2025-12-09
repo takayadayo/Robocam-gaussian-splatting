@@ -87,13 +87,13 @@ class BaselineConfig:
     # 値が大きいほど「既知ポーズ」を強く信じる。小さいほど画像合わせを優先する。
     # 目安: 1.0e-2 〜 1.0e2 程度。
     # 3DGS用なら「ポーズはかなり正確」前提なので、少し強めにかけてドリフトを防ぐ。
-    ba_pose_weight_rot: float = 1.0e-1    # 回転に対する重み
-    ba_pose_weight_trans: float = 1.0e-1  # 並進に対する重み
+    ba_pose_weight_rot: float = 0.1
+    ba_pose_weight_trans: float = 0.1
     
     # ポーズ最適化に参加させるトラックの条件
     # すべての点を使うと計算が重く、かつ低品質な点がポーズを汚染するため
     ba_opt_min_track_len: int = 3        # 3視点以上で見えている点のみポーズ最適化に使う
-    ba_opt_min_angle_deg: float = 6.0    # または、視差角がこれ以上ある場合
+    ba_opt_min_angle_deg: float = 4.0    # または、視差角がこれ以上ある場合
 
 # ============================================================
 # Data structures
@@ -673,6 +673,29 @@ def symmetric_epipolar_distance_sq(
     d_sym_sq = d1_sq + d2_sq
     return d_sym_sq
 
+def geom_verify_with_ransac_essential(
+    pts1_norm: np.ndarray,
+    pts2_norm: np.ndarray,
+    th_norm: float,
+    prob: float = 0.999,
+) -> np.ndarray:
+    """
+    正規化座標 (x,y) で Essential を RANSAC 推定し、inlier mask を返す。
+    OpenCV findEssentialMat は focal=1, pp=(0,0) で正規化座標扱いにできる。
+    """
+    if len(pts1_norm) < 5:
+        return np.zeros((len(pts1_norm),), dtype=bool)
+
+    E, mask = cv2.findEssentialMat(
+        pts1_norm, pts2_norm,
+        focal=1.0, pp=(0.0, 0.0),
+        method=cv2.RANSAC,
+        prob=prob,
+        threshold=float(th_norm),
+    )
+    if mask is None:
+        return np.zeros((len(pts1_norm),), dtype=bool)
+    return (mask.ravel() > 0)
 
 def match_features_for_pair(
     img_i: ImageInfo,
@@ -730,13 +753,7 @@ def match_features_for_pair(
     pts1 = np.float64([img_i.keypoints_norm[i] for (i, _) in mutual_pairs])
     pts2 = np.float64([img_j.keypoints_norm[j] for (_, j) in mutual_pairs])
 
-    E_known = compute_known_essential_matrix(img_i, img_j)
-    d_sym_sq = symmetric_epipolar_distance_sq(E_known, pts1, pts2)
-
-    # 4) 視差角に応じてエピポーラ閾値をスケーリング
-    #    - angle <= 2deg なら 0.5 * geom_max_error_px
-    #    - angle >= 5deg なら 1.0 * geom_max_error_px
-    #    - その間は線形補間
+    # 視差角スケールまでは既存ロジックを踏襲
     base_px = config.geom_max_error_px
     if angle_pair_deg <= 2.0:
         scale = 0.5
@@ -747,10 +764,18 @@ def match_features_for_pair(
         scale = 0.5 + 0.5 * t
 
     th_norm = (base_px * scale) / max(f_mean, 1e-6)
-    th_norm_sq = th_norm * th_norm
 
-    inlier_mask = d_sym_sq <= th_norm_sq
+    # まず RANSAC(E) でインライア抽出（COLMAP の思想に寄せる）
+    inlier_mask = geom_verify_with_ransac_essential(pts1, pts2, th_norm, prob=0.999)
+
     inlier_pairs = [pair for pair, ok in zip(mutual_pairs, inlier_mask) if ok]
+
+    # fallback: それでも足りない場合のみ known E（現状の実装）を使う
+    if len(inlier_pairs) < config.geom_min_num_inliers:
+        E_known = compute_known_essential_matrix(img_i, img_j)
+        d_sym_sq = symmetric_epipolar_distance_sq(E_known, pts1, pts2)
+        inlier_mask2 = (d_sym_sq <= (th_norm * th_norm))
+        inlier_pairs = [pair for pair, ok in zip(mutual_pairs, inlier_mask2) if ok]
 
     if len(inlier_pairs) < config.geom_min_num_inliers:
         return []
@@ -1276,47 +1301,6 @@ def statistical_outlier_removal(
 # Joint bundle adjustment (optimize poses + points)
 # ============================================================
 
-def rotmat_to_rodrigues(R: np.ndarray) -> np.ndarray:
-    rvec, _ = cv2.Rodrigues(R.astype(np.float64))
-    return rvec.reshape(3)
-
-
-def rodrigues_to_rotmat(rvec: np.ndarray) -> np.ndarray:
-    vec = rvec.astype(np.float64).reshape(3, 1)
-    R, _ = cv2.Rodrigues(vec)
-    return R
-
-
-def build_joint_ba_sparsity(
-    cam_indices: np.ndarray,
-    point_indices: np.ndarray,
-    num_cams_opt: int,
-    num_points: int,
-) -> lil_matrix:
-    """
-    Each residual depends on one camera (6 params) and one 3D point (3 params).
-    """
-    num_obs = cam_indices.shape[0]
-    rows = num_obs * 2
-    cols = num_cams_opt * 6 + num_points * 3
-    sparsity = lil_matrix((rows, cols), dtype=int)
-
-    for obs_idx in range(num_obs):
-        pt_idx = int(point_indices[obs_idx])
-        row0 = 2 * obs_idx
-        row1 = row0 + 1
-        col_p = num_cams_opt * 6 + pt_idx * 3
-        sparsity[row0, col_p : col_p + 3] = 1
-        sparsity[row1, col_p : col_p + 3] = 1
-
-        cam_idx = int(cam_indices[obs_idx])
-        if cam_idx >= 0:
-            col_c = cam_idx * 6
-            sparsity[row0, col_c : col_c + 6] = 1
-            sparsity[row1, col_c : col_c + 6] = 1
-
-    return sparsity
-
 class IterativeRefiner:
     def __init__(self, images: Dict[int, ImageInfo], config: BaselineConfig):
         self.images = images
@@ -1467,7 +1451,7 @@ class IterativeRefiner:
                 min_ang = compute_min_triangulation_angle_deg(track, self.images, Xw)
                 
                 # アンカー条件: 視差角が 2.0度以上 (設定依存)
-                if len(track) >= 3 and min_ang >= 2.0:
+                if len(track) >= 2 and min_ang >= 3.0:
                     anchor_indices.append(i)
                     for img_id, kp_idx in track:
                         # ここで point のコピーを渡さないと、後で point が更新されたときに整合性が崩れるが、
@@ -1983,8 +1967,8 @@ def main():
     # パラメータ調整:
     # 交互最適化ではポーズを少し動きやすくしても発散しにくい。
     # アンカーのみを使うため、ノイズの影響を受けにくいからである。
-    config.ba_pose_weight_rot = 1   # 必要に応じて調整 (0.1 ~ 10.0)
-    config.ba_pose_weight_trans = 1
+    config.ba_pose_weight_rot = 0.1   # 必要に応じて調整 (0.1 ~ 10.0)
+    config.ba_pose_weight_trans = 0.1
     config.tri_min_angle_deg = 4.0    # アンカー選定基準
 
     # 1. Load Data
@@ -2017,7 +2001,7 @@ def main():
     print("\n--- Phase 2: Iterative Refinement (Alternating Optimization) ---")
     # 交互最適化の実行
     refiner = IterativeRefiner(images, config)
-    points_refined = refiner.run(points_init, tracks_init, iterations=5)
+    points_refined = refiner.run(points_init, tracks_init, iterations=10)
 
     # --- ここで変化量を出力 ---
     # images は refiner.run の内部で直接更新されている

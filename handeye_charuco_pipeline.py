@@ -857,8 +857,8 @@ def reconstruct_charuco_points_in_base(
     # --- Charuco ボード定義（あなたの条件にあわせる） ---
     squares_x = 7
     squares_y = 5
-    marker_length_m = 0.024  # 24mm
-    square_length_m = 0.032  # 32mm
+    marker_length_m = 0.023  # 24mm
+    square_length_m = 0.031  # 32mm
 
     dictionary = aruco.getPredefinedDictionary(aruco.DICT_4X4_50)
     board = aruco.CharucoBoard(
