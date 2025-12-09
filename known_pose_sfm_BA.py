@@ -2001,7 +2001,7 @@ def main():
     print("\n--- Phase 2: Iterative Refinement (Alternating Optimization) ---")
     # 交互最適化の実行
     refiner = IterativeRefiner(images, config)
-    points_refined = refiner.run(points_init, tracks_init, iterations=10)
+    points_refined = refiner.run(points_init, tracks_init, iterations=25)
 
     # --- ここで変化量を出力 ---
     # images は refiner.run の内部で直接更新されている
