@@ -58,7 +58,7 @@ class BaselineConfig:
     # Matching
     sift_ratio: float = 0.7
     cross_check: bool = True
-    geom_max_error_px: float = 0.5   # ★ 4→3 に引き締め（エピポーラ誤差）
+    geom_max_error_px: float = 0.4   # エピポーラ誤差
     geom_confidence: float = 0.999
     geom_min_inlier_ratio: float = 0.25
     geom_min_num_inliers: int = 10
@@ -87,13 +87,13 @@ class BaselineConfig:
     # 値が大きいほど「既知ポーズ」を強く信じる。小さいほど画像合わせを優先する。
     # 目安: 1.0e-2 〜 1.0e2 程度。
     # 3DGS用なら「ポーズはかなり正確」前提なので、少し強めにかけてドリフトを防ぐ。
-    ba_pose_weight_rot: float = 0
-    ba_pose_weight_trans: float = 0
+    ba_pose_weight_rot: float = 0.5
+    ba_pose_weight_trans: float = 0.5
     
     # ポーズ最適化に参加させるトラックの条件
     # すべての点を使うと計算が重く、かつ低品質な点がポーズを汚染するため
     ba_opt_min_track_len: int = 3        # 3視点以上で見えている点のみポーズ最適化に使う
-    ba_opt_min_angle_deg: float = 4.0    # または、視差角がこれ以上ある場合
+    ba_opt_min_angle_deg: float = 5.0    # または、視差角がこれ以上ある場合
 
 # ============================================================
 # Data structures
@@ -1963,13 +1963,6 @@ def parse_args() -> argparse.Namespace:
 def main():
     args = parse_args()
     config = BaselineConfig()
-    
-    # パラメータ調整:
-    # 交互最適化ではポーズを少し動きやすくしても発散しにくい。
-    # アンカーのみを使うため、ノイズの影響を受けにくいからである。
-    config.ba_pose_weight_rot = 0   # 必要に応じて調整 (0.1 ~ 10.0)
-    config.ba_pose_weight_trans = 0
-    config.tri_min_angle_deg = 4.0    # アンカー選定基準
 
     # 1. Load Data
     K, dist = load_intrinsics_from_yaml(args.intrinsics_yaml)
