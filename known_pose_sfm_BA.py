@@ -70,7 +70,7 @@ class BaselineConfig:
     use_two_view_tracks_for_gs: bool = True
     
     # Track quality classification
-    strong_track_min_angle_deg: float = 6.0  # ≧この視差角 or 長さ≥4なら強トラック
+    strong_track_min_angle_deg: float = 5.0  # ≧この視差角 or 長さ≥4なら強トラック
     weak_track_min_angle_deg: float = 3.0    # ≧この視差角なら弱トラック候補
 
     # BA loss / filtering (px → 後で正規化)
@@ -93,7 +93,7 @@ class BaselineConfig:
     # ポーズ最適化に参加させるトラックの条件
     # すべての点を使うと計算が重く、かつ低品質な点がポーズを汚染するため
     ba_opt_min_track_len: int = 3        # 3視点以上で見えている点のみポーズ最適化に使う
-    ba_opt_min_angle_deg: float = 2.0    # または、視差角がこれ以上ある場合
+    ba_opt_min_angle_deg: float = 4.0    # または、視差角がこれ以上ある場合
 
 # ============================================================
 # Data structures
@@ -1451,7 +1451,7 @@ class IterativeRefiner:
                 min_ang = compute_min_triangulation_angle_deg(track, self.images, Xw)
                 
                 # アンカー条件: 視差角が 2.0度以上 (設定依存)
-                if len(track) >= 3 and min_ang >= 2.0:
+                if len(track) >= 3 and min_ang >= 5.0:
                     anchor_indices.append(i)
                     for img_id, kp_idx in track:
                         # ここで point のコピーを渡さないと、後で point が更新されたときに整合性が崩れるが、
