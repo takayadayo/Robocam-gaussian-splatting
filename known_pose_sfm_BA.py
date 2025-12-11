@@ -58,7 +58,7 @@ class BaselineConfig:
     # Matching
     sift_ratio: float = 0.7
     cross_check: bool = True
-    geom_max_error_px: float = 0.1   # エピポーラ誤差
+    geom_max_error_px: float = 0.04   # エピポーラ誤差
     geom_confidence: float = 0.999
     geom_min_inlier_ratio: float = 0.25
     geom_min_num_inliers: int = 10
