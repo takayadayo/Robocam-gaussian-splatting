@@ -309,6 +309,36 @@ def compute_errors(
     }
 
 
+def compute_per_frame_errors(
+    ref: Dict[str, PoseWC],
+    est: Dict[str, PoseWC],
+    keys: List[str],
+    model: Sim3
+) -> List[Tuple[str, float, float]]:
+    """
+    Per-frame errors after applying the estimated alignment model.
+
+    Returns:
+      list of (name, translation_error, rotation_error_deg)
+      - translation_error: Euclidean error between camera centers (aligned est vs ref)
+      - rotation_error_deg: geodesic angle of (R_ref^T * R_est_aligned)
+    """
+    C_ref = np.stack([ref[k].C_w for k in keys], axis=0)  # (N,3)
+    C_est = np.stack([est[k].C_w for k in keys], axis=0)  # (N,3)
+    C_est_al = model.apply_points(C_est)                  # (N,3)
+    t_err = np.linalg.norm(C_ref - C_est_al, axis=1)
+
+    R_ref = np.stack([ref[k].R_wc for k in keys], axis=0)  # (N,3,3)
+    R_est = np.stack([est[k].R_wc for k in keys], axis=0)  # (N,3,3)
+    R_est_al = model.apply_rotations_wc(R_est)             # (N,3,3)
+
+    r_err = np.empty((len(keys),), dtype=np.float64)
+    for i in range(len(keys)):
+        R_delta = R_ref[i].T @ R_est_al[i]
+        r_err[i] = rotation_angle_deg(R_delta)
+
+    return [(k, float(t_err[i]), float(r_err[i])) for i, k in enumerate(keys)]
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -355,6 +385,22 @@ def main():
     else:
         model = umeyama_alignment(C_ref, C_est, with_scale=args.with_scale)
         keys_eval = keys
+
+
+    # Per-frame errors (computed after applying the estimated alignment)
+    keys_report = keys  # report all common frames (including RANSAC outliers, if any)
+    per_frame = compute_per_frame_errors(ref, est, keys_report, model)
+
+    if args.ransac:
+        inlier_map = {k: bool(m) for k, m in zip(keys, inliers)}
+    else:
+        inlier_map = {k: True for k in keys}
+
+    print("===== Per-frame Errors AFTER optimal alignment =====")
+    print("name\tinlier\ttrans_err\trot_err_deg")
+    for name, te, re_deg in per_frame:
+        flag = "1" if inlier_map.get(name, False) else "0"
+        print(f"{name}\t{flag}\t{te:.6f}\t{re_deg:.6f}")
 
     stats = compute_errors(ref, est, keys_eval, model)
 
