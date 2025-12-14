@@ -53,22 +53,22 @@ class BaselineConfig:
     seq_neighbor_window: int = 3
 
     # Matching
-    sift_ratio: float = 0.8
+    sift_ratio: float = 0.7
     cross_check: bool = True
-    geom_max_error_px: float = 0.4   # ★ 4→3 に引き締め（エピポーラ誤差）
+    geom_max_error_px: float = 0.1   # ★ 4→3 に引き締め（エピポーラ誤差）
     geom_confidence: float = 0.999
     geom_min_inlier_ratio: float = 0.25
     geom_min_num_inliers: int = 10
     guided_matching: bool = False
 
     # Triangulation & BA
-    tri_min_angle_deg: float = 4.0   # ★ 1.5→2.0deg（COLMAP推奨より少しだけ強め）
+    tri_min_angle_deg: float = 2.0   # ★ 1.5→2.0deg（COLMAP推奨より少しだけ強め）
     use_two_view_tracks_for_eval: bool = False
     use_two_view_tracks_for_gs: bool = True
     
     # Track quality classification
-    strong_track_min_angle_deg: float = 10.0  # ≧この視差角 or 長さ≥4なら強トラック
-    weak_track_min_angle_deg: float = 4.0    # ≧この視差角なら弱トラック候補
+    strong_track_min_angle_deg: float = 6.0  # ≧この視差角 or 長さ≥4なら強トラック
+    weak_track_min_angle_deg: float = 3.0    # ≧この視差角なら弱トラック候補
 
     # BA loss / filtering (px → 後で正規化)
     ba_loss_scale_px: float = 1.0    # ★ ロバスト閾値もやや厳しく
