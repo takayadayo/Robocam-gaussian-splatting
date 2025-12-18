@@ -58,7 +58,7 @@ class BaselineConfig:
     # Matching
     sift_ratio: float = 0.7
     cross_check: bool = True
-    geom_max_error_px: float = 0.03   # エピポーラ誤差
+    geom_max_error_px: float = 0.02   # エピポーラ誤差
     geom_confidence: float = 0.999
     geom_min_inlier_ratio: float = 0.25
     geom_min_num_inliers: int = 10
@@ -87,8 +87,8 @@ class BaselineConfig:
     # 値が大きいほど「既知ポーズ」を強く信じる。小さいほど画像合わせを優先する。
     # 目安: 1.0e-2 〜 1.0e2 程度。
     # 3DGS用なら「ポーズはかなり正確」前提なので、少し強めにかけてドリフトを防ぐ。
-    ba_pose_weight_rot: float = 0.5
-    ba_pose_weight_trans: float = 0.5
+    ba_pose_weight_rot: float = 0.1
+    ba_pose_weight_trans: float = 0.1
     
     # ポーズ最適化に参加させるトラックの条件
     # すべての点を使うと計算が重く、かつ低品質な点がポーズを汚染するため
